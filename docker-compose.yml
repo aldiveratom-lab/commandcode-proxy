@@ -4,7 +4,7 @@ services:
   proxy:
     build: .
     ports:
-      - "${PROXY_PORT:-3050}:3050"
+      - "127.0.0.1:${PROXY_PORT:-3050}:3050"
     environment:
       PORT: "3050"
     restart: unless-stopped
