@@ -1,6 +1,8 @@
 node_modules/
-.git/
+**/node_modules/
+frontend/dist/
 *.log
+.git/
 .commandcode/
 .opencode/
 .omo/
