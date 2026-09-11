@@ -7,7 +7,7 @@ RUN npx --no-install vite build
 
 FROM node:24-alpine
 WORKDIR /app
-COPY package.json ./
+COPY scripts/ ./scripts/
 COPY protocols.mjs server.mjs ./
 COPY lib/ ./lib/
 COPY --from=frontend /build/frontend/dist ./frontend/dist
