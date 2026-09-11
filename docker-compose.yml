@@ -2,6 +2,7 @@ services:
   proxy:
     build: .
     image: local/commandcode-proxy:console
+    user: "0:0"
     restart: unless-stopped
     ports:
       - "127.0.0.1:${MANAGEMENT_PORT:-3050}:3050"
