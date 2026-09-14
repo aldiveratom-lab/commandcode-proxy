@@ -385,8 +385,12 @@ test('messages, responses, and chat completions all stream and buffer converted 
       streamBody: { model: 'alpha-model', messages: [{ role: 'system', content: 'be concise' }, { role: 'user', content: 'hello' }], stream: true },
       plainBody: { model: 'alpha-model', messages: [{ role: 'user', content: 'hello' }], stream: false },
       checkRequest(body) {
-        assert.equal(body.params.system, 'be concise');
+        assert.deepEqual(body.params.system, [{ type: 'text', text: 'be concise' }]);
         assert.deepEqual(body.params.messages, [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]);
+        assert.deepEqual(body.params.tools, []);
+        assert.equal(body.skills, null);
+        assert.equal(body.mode, 'agent');
+        assert.equal(body.config.environment, 'win32');
       },
       checkStream(text) {
         assert.match(text, /data: \[DONE\]/);
@@ -427,7 +431,7 @@ test('messages, responses, and chat completions all stream and buffer converted 
       streamBody: { model: 'alpha-model', instructions: 'be concise', input: 'hello', stream: true },
       plainBody: { model: 'alpha-model', instructions: 'be concise', input: 'hello', stream: false },
       checkRequest(body) {
-        assert.equal(body.params.system, 'be concise');
+        assert.deepEqual(body.params.system, [{ type: 'text', text: 'be concise' }]);
         assert.deepEqual(body.params.messages, [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }]);
       },
       checkStream(text) {

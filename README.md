@@ -355,18 +355,18 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Based on analysis of official CLI traffic (version auto-fetched from npm registry):
+Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**) — see `PROTOCOL-FACTS-1.53.1.md`:
 
 | Mechanism | Implementation |
 |-----------|---------------|
-| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; random fingerprint pool (15 CPUs, global timezones), SHA-256 hashed, per-key binding, refreshed every 8h + 2h jitter |
-| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`) sent in parallel with fingerprint on session init |
+| **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
+| **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` auto-fetched from npm registry (24h refresh) |
-| **CLI Envelope** | config/memory/taste/skills/permissionMode/params |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **Environment** | `x-cli-environment: production`, `x-co-flag: "false"`, `x-taste-learning: "false"` |
-| **Project Slug** | `x-project-slug` generated from session ID (CLI-compatible format) |
+| **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |
+| **Project Slug** | `x-project-slug` = `slugify(process.cwd())` — same source as `config.workingDir` |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
