@@ -554,3 +554,21 @@ test('inference and management routes stay isolated; 401 is isolated and 429 is 
   assert.equal(forbidden.body.error.code, 'model_not_allowed');
   assert.equal(state.generateRequests.length, beforeForbidden);
 });
+
+test('event statusCode is preserved instead of collapsing to 502', async () => {
+  state.generateByModel.set('alpha-model', {
+    status: 200,
+    events: [
+      { type: 'text-start' },
+      { type: 'error', error: { message: 'provider at capacity', statusCode: 429 } },
+    ],
+  });
+  const result = await inferenceCall('/v1/chat/completions', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${clientKey}` },
+    body: { model: 'alpha-model', messages: [{ role: 'user', content: 'trigger event error' }], stream: false },
+  });
+  assert.equal(result.status, 429);
+  assert.equal(result.body.error.type, 'rate_limit_error');
+  assert.equal(result.response.headers.get('retry-after'), '30');
+});

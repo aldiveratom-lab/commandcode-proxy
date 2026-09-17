@@ -18,12 +18,20 @@ const app = await createApplication({
   maxInflight: Number(process.env.CC_MAX_INFLIGHT || 4),
   maxBodyBytes: Number(process.env.CC_MAX_BODY_MB || 8) * 1024 * 1024,
 });
-const management = http.createServer({ requestTimeout: 30000, headersTimeout: 10000 }, app.management);
-const inference = http.createServer({ requestTimeout: 60000, headersTimeout: 10000 }, app.inference);
+const configuredKeepAliveTimeout = Number.parseInt(process.env.CC_KEEPALIVE_TIMEOUT_MS || '', 10);
+const keepAliveTimeout = Number.isFinite(configuredKeepAliveTimeout) && configuredKeepAliveTimeout > 0
+  ? configuredKeepAliveTimeout : 65000;
+const serverOptions = requestTimeout => ({
+  requestTimeout,
+  keepAliveTimeout,
+  headersTimeout: keepAliveTimeout + 1000,
+});
+const management = http.createServer(serverOptions(30000), app.management);
+const inference = http.createServer(serverOptions(60000), app.inference);
 management.listen(Number(process.env.PORT || 3050), process.env.HOST || '127.0.0.1');
 inference.listen(Number(process.env.INFERENCE_PORT || 3051), process.env.HOST || '127.0.0.1');
 const stopMaintenance = startProtocolMaintenance();
-console.log('CommandCode management and private inference listeners started');
+console.log(`CommandCode management and private inference listeners started; keepAliveTimeout ${keepAliveTimeout}ms (反代侧 keepalive_timeout 必须小于它)`);
 let stopping = false;
 async function shutdown() {
   if (stopping) return; stopping = true; stopMaintenance();
