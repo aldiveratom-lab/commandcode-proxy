@@ -2,7 +2,9 @@
  * Command Code → OpenAI 兼容代理
  * 基于真实 CLI 流量抓包数据构建
  */
-import http from 'http';
+import { AsyncLocalStorage } from 'node:async_hooks';
+const requestContext = new AsyncLocalStorage();
+export const runProtocol = (context, fn) => requestContext.run(context, fn);
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
@@ -23,6 +25,10 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
+    cliMode: 'agent', // 信封 mode。服务端枚举（真机 400 报出来的）：agent|learning|custom-agent|custom-agent-create|title-gen|tool-desc|compact|vision
+    cliSessionMode: 'interactive', // lifecycle metadata 的 mode —— 注意这是另一个枚举：interactive | non-interactive
+    fingerprintSalt: '', // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
+    deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
   };
 
@@ -44,6 +50,10 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.CC_FINGERPRINT_SALT !== undefined) defaults.fingerprintSalt = process.env.CC_FINGERPRINT_SALT;
+  if (process.env.CC_DEVICE_PROJECT_DIR) defaults.deviceProjectDir = process.env.CC_DEVICE_PROJECT_DIR;
+  if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
+  if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
 
   return defaults;
@@ -51,10 +61,10 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 指纹生成（首次运行自动生成，写回 config.json） ──────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
-  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },
+  { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
   { model: '12th Gen Intel(R) Core(TM) i5-12400F', cores: 6 },
   { model: '12th Gen Intel(R) Core(TM) i9-12900K', cores: 16 },
   { model: '13th Gen Intel(R) Core(TM) i7-13700K', cores: 16 },
@@ -79,26 +89,80 @@ const FINGERPRINT_TZS = [
 ];
 const FINGERPRINT_MAC_COUNT_RANGE = [2, 3, 4, 5]; // 随机 2~5 个 MAC
 
-function generateFingerprint() {
-  const cpuEntry = FINGERPRINT_CPUS[Math.floor(Math.random() * FINGERPRINT_CPUS.length)];
-  const memGiB = FINGERPRINT_MEMS[Math.floor(Math.random() * FINGERPRINT_MEMS.length)];
-  const tz = FINGERPRINT_TZS[Math.floor(Math.random() * FINGERPRINT_TZS.length)];
-  const macCount = FINGERPRINT_MAC_COUNT_RANGE[Math.floor(Math.random() * FINGERPRINT_MAC_COUNT_RANGE.length)];
+// CLI 的根盐（buildMachineFingerprint 常量 sb）
+const FP_SALT = 'command-code:device-fingerprint:v1';
+// 设备档案：指纹 / config.environment / config.workingDir / x-project-slug / lifecycle.os 共用同一份，
+// 避免出现「指纹说 win32、环境说 linux」这类自相矛盾，也避免把宿主机真实信息（平台、Node 版本、cwd）交给上游。
+const DEVICE_PROFILE = {
+  platform: 'win32',
+  arch: 'x64',
+  osRelease: '10.0.22631',
+  isContainer: false,
+  // 伪造的项目目录：与 x-project-slug 同源（真机里 slug = slugify(workingDir)）
+  projectDir: CFG.deviceProjectDir || 'C:\\Users\\dev\\projects\\app',
+};
+const FP_OS_USERS = ['dev', 'user', 'admin', 'coder', 'engineer', 'work'];
+const FP_MAIL_DOMAINS = ['gmail.com', 'outlook.com', 'qq.com', '163.com'];
 
-  function sha256(s) { return crypto.createHash('sha256').update(s).digest('hex'); }
-  function randHex(n) { return crypto.randomBytes(n).toString('hex'); }
+// 伪造信号的派生源。加 CC_FINGERPRINT_SALT 可成批换身份 —— 真实账号的 key 动不了，这是逃生口。
+// 注意：哈希阶段用的是 CLI 的固定盐（FP_SALT），salt 只影响「伪造出哪台机器」。
+function fpDigest(apiKey, field) {
+  return crypto.createHash('sha256')
+    .update(`${CFG.fingerprintSalt || ''}\0${apiKey}\0${field}`)
+    .digest();
+}
+// 从候选池确定性地挑一项：打分取最大。以后往池里加候选只影响「新候选恰好胜出」的那部分 key，
+// 不会像取模那样因为池长度变化让所有 key 一起换设备。
+function fpPickIndex(apiKey, field, items, labelOf) {
+  let bestIdx = 0;
+  let bestScore = null;
+  for (let i = 0; i < items.length; i++) {
+    const score = fpDigest(apiKey, `${field}\0${labelOf(i)}`);
+    if (!bestScore || Buffer.compare(score, bestScore) > 0) { bestScore = score; bestIdx = i; }
+  }
+  return bestIdx;
+}
+// CLI 的 hashSignal：sha256(FP_SALT + "\0" + value.toLowerCase())，空值返回 undefined（JSON 里被丢掉）
+function fingerprintHash(value) {
+  const v = String(value ?? '').trim();
+  if (!v) return undefined;
+  return crypto.createHash('sha256').update(`${FP_SALT}\0${v.toLowerCase()}`).digest('hex');
+}
 
-  const macHashes = [];
-  for (let i = 0; i < macCount; i++) macHashes.push(sha256(randHex(32)));
+// 与 CLI 的唯一区别是「信号值」：CLI 读真实机器（注册表 / ioreg / machine-id、网卡 MAC、
+// os.userInfo、git config），这里按 apiKey 确定性地伪造一组逼真值。
+// 为什么必须由 apiKey 派生而不是随机：指纹代表「这个账号对应的那台设备」，重启、内存回收、
+// 多实例、月额度用尽停用数周后恢复，上游都应看到同一台设备；换指纹本身就是可疑信号。
+function generateFingerprint(apiKey) {
+  const cpuEntry = FINGERPRINT_CPUS[fpPickIndex(apiKey, 'cpu', FINGERPRINT_CPUS, i => `${FINGERPRINT_CPUS[i].model}|${FINGERPRINT_CPUS[i].cores}`)];
+  const memGiB = FINGERPRINT_MEMS[fpPickIndex(apiKey, 'mem', FINGERPRINT_MEMS, i => String(FINGERPRINT_MEMS[i]))];
+  const tz = FINGERPRINT_TZS[fpPickIndex(apiKey, 'timezone', FINGERPRINT_TZS, i => FINGERPRINT_TZS[i])];
+  const macCount = FINGERPRINT_MAC_COUNT_RANGE[fpPickIndex(apiKey, 'macCount', FINGERPRINT_MAC_COUNT_RANGE, i => String(FINGERPRINT_MAC_COUNT_RANGE[i]))];
+  const osUser = FP_OS_USERS[fpPickIndex(apiKey, 'osUser', FP_OS_USERS, i => FP_OS_USERS[i])];
+  const mailDomain = FP_MAIL_DOMAINS[fpPickIndex(apiKey, 'mailDomain', FP_MAIL_DOMAINS, i => FP_MAIL_DOMAINS[i])];
+  const hex = (field, bytes) => fpDigest(apiKey, field).subarray(0, bytes).toString('hex');
+  // Windows MachineGuid 形状：8-4-4-4-12
+  const mid = hex('machineId', 16);
+  const machineId = `${mid.slice(0, 8)}-${mid.slice(8, 12)}-${mid.slice(12, 16)}-${mid.slice(16, 20)}-${mid.slice(20, 32)}`;
+  const macs = [];
+  for (let i = 0; i < macCount; i++) {
+    const b = fpDigest(apiKey, `mac${i}`).subarray(0, 6);
+    macs.push([...b].map(x => x.toString(16).padStart(2, '0')).join(':'));
+  }
+  macs.sort(); // CLI 对 MAC 去重后排序
+  const hostname = `DESKTOP-${hex('hostname', 4).toUpperCase()}`;
+  const gitEmail = `${osUser}.${hex('gitEmail', 3)}@${mailDomain}`;
 
-  const machineIdHash = sha256(randHex(32));
-  const osUserHash = sha256(randHex(16));
-  const hostnameHash = sha256(randHex(16));
-  const gitEmailHash = sha256(randHex(16));
+  const machineIdHash = fingerprintHash(machineId);
+  const macHashes = macs.map(fingerprintHash).filter(Boolean);
+  const osUserHash = fingerprintHash(osUser);
+  const hostnameHash = fingerprintHash(hostname);
+  const gitEmailHash = fingerprintHash(gitEmail);
 
-  // thumbmark = 所有组件的联合哈希
-  const thumbData = [machineIdHash, ...macHashes, osUserHash, hostnameHash, gitEmailHash, 'win32', '10.0.22631', cpuEntry.model, String(cpuEntry.cores), String(memGiB)].join('|');
-  const thumbmark = sha256(thumbData);
+  // CLI 的 thumbmark：主盐 + "\0machine\0" + join([machineId, macs.join(",")])
+  // （machineId 非空时不再拼 hostname/cpuModel）
+  const thumbSeed = [machineId.trim(), macs.join(','), machineId.trim() ? '' : hostname, machineId.trim() ? '' : cpuEntry.model].filter(Boolean);
+  const thumbmark = crypto.createHash('sha256').update(`${FP_SALT}\0machine\0${thumbSeed.join('|') || 'unknown'}`).digest('hex');
 
   return {
     thumbmark,
@@ -108,13 +172,13 @@ function generateFingerprint() {
       osUserHash,
       hostnameHash,
       gitEmailHash,
-      platform: 'win32',
-      arch: 'x64',
-      osRelease: '10.0.22631',
+      platform: DEVICE_PROFILE.platform,
+      arch: DEVICE_PROFILE.arch,
+      osRelease: DEVICE_PROFILE.osRelease,
       cpuModel: cpuEntry.model,
       cpuCount: cpuEntry.cores,
       memGiB,
-      isContainer: false,
+      isContainer: DEVICE_PROFILE.isContainer,
       timezone: tz,
       runtime: 'cli',
       collectorVersion: 1,
@@ -122,27 +186,42 @@ function generateFingerprint() {
   };
 }
 
-let CC_VERSION = '0.32.3';
-const CC_VERSION_FALLBACK = '0.32.3';
-const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — npm registry 刷新间隔
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+// 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
+// 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
+// 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
+const CC_PROTOCOL_VERSION = '1.53.1';
+let CC_VERSION = CC_PROTOCOL_VERSION;
+const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
-// ── 动态 CC 版本号（从 npm registry 拉取） ─────────────
-async function refreshCCVersion() {
+// ── 协议漂移检测（只告警，不改版本号） ─────────────
+// 上游 CLI 更新可能带来协议变化。这里只负责提醒「该重新读包对齐了」，
+// 绝不会把 x-command-code-version 改成一个我们并未实现的版本。
+async function checkProtocolDrift() {
   try {
     const url = 'https://registry.npmjs.org/command-code/latest';
     const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
     if (!res.ok) throw new Error(`npm responded with ${res.status}`);
     const pkg = await res.json();
-    if (pkg.version && typeof pkg.version === 'string') {
-      CC_VERSION = pkg.version;
-      log('info', 'CC Version refreshed from npm', { version: CC_VERSION });
+    const latest = typeof pkg?.version === 'string' ? pkg.version : null;
+    if (latest && latest !== CC_PROTOCOL_VERSION) {
+      log('warn', 'CC CLI version drift: protocol may have changed, re-align from the npm package', {
+        implemented: CC_PROTOCOL_VERSION, latest,
+      });
+    } else if (latest) {
+      log('info', 'CC CLI version in sync', { version: latest });
     }
   } catch (e) {
-    log('warn', 'CC Version fetch failed, using current', { version: CC_VERSION, error: e.message });
+    log('warn', 'CC version check failed', { error: e.message });
   }
 }
-refreshCCVersion(); // 启动时立即拉取
-setInterval(refreshCCVersion, CC_VERSION_REFRESH_MS);
+
+export function startProtocolMaintenance() {
+  checkProtocolDrift();
+  const timer = setInterval(checkProtocolDrift, CC_VERSION_REFRESH_MS);
+  timer.unref();
+  return () => clearInterval(timer);
+}
 
 // 请求体大小上限：默认 100MB，可用环境变量 CC_MAX_BODY_MB 覆盖（正整数，单位 MB）
 // ⚠️ 内存特性（issue #20 实测）：请求体在转发到上游前会同时存在多份副本 ——
@@ -172,21 +251,6 @@ const NONSTREAM_IDLE_TIMEOUT_MS = (() => {
 // 实测残留在途成本约 5MB/连接 —— 有界、不泄漏、断开即回收，但连接数本身无上限。
 // 默认 0 = 禁用，保持既有行为不变：僵死客户端与「卡在工具执行的合法客户端」在协议层无法
 // 区分，而官方 CLI 对上游没有任何 idle timeout（issue #19），贸然加超时会误杀健康请求。
-// 在途请求上限（可选，默认关闭）。项目定位是纯反代层，并发控制属于下游（nginx
-// limit_conn，per-IP / per-key）；本项仅为「不挂反代裸跑」的场景提供一个可选的
-// 进程内全局兜底，不替代下游方案，也不感知客户端身份。
-// 内存 = 在途数 × (0.13MB + 5.5 × body_MB)：body 上限只管住单请求量级，乘数由本项封顶。
-// 超限返回 503 + Retry-After（SDK 会自行退避重试），而不是放任进程被 OOM 杀掉。
-// 默认 0 = 关闭，不限制并发（既有的反代层定位不变，行为零变化）；需要时按需开启：
-//   CC_MAX_INFLIGHT=32 npm start
-// 注意：body 上限只管住单请求量级，乘数由本项封顶。默认 body 上限 100MB 时，
-// N × 最坏 550MB —— 要硬性内存上界需同时下调 CC_MAX_BODY_MB。
-const MAX_INFLIGHT = (() => {
-  const n = Number.parseInt(process.env.CC_MAX_INFLIGHT ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 0;            // 默认 0 = 不限
-})();
-
-let inflightCount = 0;   // 当前在途请求数（不含 /health）
 
 const CLIENT_DRAIN_TIMEOUT_MS = (() => {
   const ms = Number.parseInt(process.env.CC_CLIENT_DRAIN_TIMEOUT_MS ?? '', 10);
@@ -199,11 +263,26 @@ const TIMEOUT_REDUCE_CONTEXT_THRESHOLD = 3;
 
 // ── 日志 ─────────────────────────────────────────────
 function log(level, msg, data) {
-  const line = `[${new Date().toISOString()}] [${level}] ${msg}${data ? ' ' + JSON.stringify(data) : ''}`;
-  console.log(line);
-  if (CFG.logFile) {
-    try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
+  const context = requestContext.getStore();
+  if (context && (level === 'error' || /idle timeout/i.test(msg)) && !(context.status >= 400)) context.status = 502;
+  const allowText = new Set(['body', 'code', 'type', 'implemented', 'latest', 'version', 'error', 'message']);
+  const metrics = {};
+  for (const [key, value] of Object.entries(data || {})) {
+    if (typeof value === 'number' || typeof value === 'boolean') metrics[key] = value;
+    else if (typeof value === 'string' && allowText.has(key)) metrics[key] = value.replace(/user_[a-zA-Z0-9_-]+/g, 'user_[redacted]');
   }
+  const line = `[${new Date().toISOString()}] [${level}] ${msg} ${JSON.stringify(metrics)}`;
+  console.log(line);
+  if (CFG.logFile) { try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {} }
+}
+
+// 把上游错误体摘要成单行，便于日志排查。
+// 之前 CC API error 只记 status，不记 body —— 遇到 400 只能靠猜（问题来源见 hk_sji 排查）。
+// 截断到 500 字符，避免异常大的 body 刷爆日志；同时压掉换行，保证一条日志一行。
+function summarizeUpstreamError(text, limit = 500) {
+  if (!text) return '';
+  const flat = String(text).replace(/\s+/g, ' ').trim().replace(/user_[a-zA-Z0-9_-]+/g, 'user_[redacted]');
+  return flat.length > limit ? flat.slice(0, limit) + '…(' + (flat.length - limit) + ' more)' : flat;
 }
 
 // ── 会话管理 ───────────────────────────────────────
@@ -242,7 +321,7 @@ setInterval(() => {
     }
   }
   if (cleaned > 0) log('info', 'Session cleanup', { cleaned, remaining: sessionStore.size });
-}, 60 * 60 * 1000); // 每小时
+}, 60 * 60 * 1000).unref();
 
 function getSessionId(incomingHeaders, apiKey, promptCacheKey) {
   // 优先从客户端传来的 session 类 header 获取
@@ -270,7 +349,7 @@ function getOrCreateKeyState(apiKey) {
   let state = keyStateStore.get(apiKey);
   if (!state) {
     state = {
-      fingerprint: generateFingerprint(),
+      fingerprint: generateFingerprint(apiKey),
       nextInitAt: 0,
     };
     keyStateStore.set(apiKey, state);
@@ -284,6 +363,9 @@ const INIT_REFRESH_MS = 8 * 60 * 60 * 1000;    // 8h
 const INIT_JITTER_MS  = 2 * 60 * 60 * 1000;    // 2h 抖动
 
 async function ensureInitialized(apiKey, signal) {
+  const context = requestContext.getStore();
+  const apiBase = context?.apiBase || CFG.apiBase;
+  signal = AbortSignal.any([signal, context?.signal, AbortSignal.timeout(10000)].filter(Boolean));
   const state = getOrCreateKeyState(apiKey);
   const now = Date.now();
   if (now < state.nextInitAt) return;
@@ -300,7 +382,7 @@ async function ensureInitialized(apiKey, signal) {
     const fingerprint = state.fingerprint || {};
 
     await Promise.all([
-      fetch(`${CFG.apiBase}/alpha/fingerprint/record`, {
+      fetch(`${apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
       }).then(r => {
@@ -310,14 +392,14 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
       }),
 
-      fetch(`${CFG.apiBase}/alpha/lifecycle-events`, {
+      fetch(`${apiBase}/alpha/lifecycle-events`, {
         method: 'POST', headers, signal,
         body: JSON.stringify({
           eventType: 'cli_session_exists',
           metadata: {
             sessionId: `sess_${crypto.randomBytes(8).toString('hex')}`,
             cliVersion: CC_VERSION,
-            mode: 'interactive',
+            mode: CFG.cliSessionMode || 'interactive',
             os: `${fingerprint.components.platform}-${fingerprint.components.arch}`,
           },
         }),
@@ -339,72 +421,17 @@ async function ensureInitialized(apiKey, signal) {
 }
 
 // ── 模型列表 ───────────────────────────────────────
-const MODELS = [
-  // Anthropic
-  { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6' },
-  { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-  { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-  { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5' },
-  // OpenAI
-  { id: 'gpt-5.5', name: 'GPT-5.5' },
-  { id: 'gpt-5.4', name: 'GPT-5.4' },
-  { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
-  { id: 'gpt-5.3-codex', name: 'GPT-5.3 Codex' },
-  // DeepSeek
-  { id: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro' },
-  { id: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash' },
-  // Kimi
-  { id: 'moonshotai/Kimi-K2.6', name: 'Kimi K2.6' },
-  { id: 'moonshotai/Kimi-K2.5', name: 'Kimi K2.5' },
-  // GLM
-  { id: 'zai-org/GLM-5.1', name: 'GLM 5.1' },
-  { id: 'zai-org/GLM-5', name: 'GLM 5' },
-  // MiniMax
-  { id: 'MiniMaxAI/MiniMax-M3', name: 'MiniMax M3' },
-  { id: 'MiniMaxAI/MiniMax-M2.7', name: 'MiniMax M2.7' },
-  { id: 'MiniMaxAI/MiniMax-M2.5', name: 'MiniMax M2.5' },
-  // Qwen
-  { id: 'Qwen/Qwen3.6-Max-Preview', name: 'Qwen 3.6 Max Preview' },
-  { id: 'Qwen/Qwen3.6-Plus', name: 'Qwen 3.6 Plus' },
-  { id: 'Qwen/Qwen3.7-Max', name: 'Qwen 3.7 Max' },
-  // Step
-  { id: 'stepfun/Step-3.7-Flash', name: 'Step 3.7 Flash' },
-  { id: 'stepfun/Step-3.5-Flash', name: 'Step 3.5 Flash' },
-  // Xiaomi
-  { id: 'xiaomi/mimo-v2.5-pro', name: 'MiMo V2.5 Pro' },
-  { id: 'xiaomi/mimo-v2.5', name: 'MiMo V2.5' },
-  // Gemini
-  { id: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash' },
-  { id: 'google/gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite' },
-];
 
 // ── 工具函数 ───────────────────────────────────────
 
-// 从 sessionId 构造一个假的工作目录路径，再按真实 CLI 规则生成 slug
-// 结果形如 "d-users-dev-projects-web-app-a3f2" (和真实 CLI 的 slug 格式一致)
-function fakeProjectSlug(sessionId) {
-  const names = ['app', 'api', 'backend', 'bot', 'cli', 'core', 'data', 'frontend',
-    'lib', 'plugin', 'proxy', 'server', 'service', 'tool', 'web', 'worker'];
-  const id = String(sessionId || '');
-  const head = id.slice(0, 4);
-  // sessionId 既可能是随机 UUID（前 4 位十六进制），也可能是客户端自定义的
-  // prompt_cache_key（如 "my-stable-cache-key-001"）。后者按 16 进制解析得 NaN，
-  // 会让 slug 变成 "…-undefined-my-s"。失败时退化为确定性字符哈希。
-  let idx = parseInt(head, 16);
-  if (!Number.isFinite(idx)) {
-    let h = 0;
-    for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
-    idx = h;
-  }
-  const name = names[idx % names.length];
-  const suffix = head || '0000';
-  // 模拟一个类似 C:\Users\dev\projects\{name}-{suffix} 的路径
-  const path = `C:\\Users\\dev\\projects\\${name}-${suffix}`;
-  return path
+// CLI 的 slug 规则：对**完整工作目录**做 slugify（@sindresorhus/slugify），空则 "root"，无随机后缀；
+// 同一个 slug 也是 CLI 本地会话目录名。所以 slug 与 config.workingDir 同源：slug = slugify(workingDir)。
+function slugifyProjectPath(p) {
+  const s = String(p || '')
     .toLowerCase()
-    .replace(/^[a-z]:/i, '')
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '');
+  return s || 'root';
 }
 
 function generateTraceparent() {
@@ -421,26 +448,35 @@ function getDateStr() {
   return new Date().toISOString().slice(0, 10);
 }
 
-function getEnvironment() {
-  return `${process.platform}-${process.arch}, Node.js ${process.version.slice(1)}`;
-}
 
 // ── CC 请求体构建 ─────────────────────────────────
 
 function buildCcRequest(openaiReq) {
   const { model, messages, max_tokens, temperature, tools, stream, reasoning_effort, tool_choice, parallel_tool_calls, prompt_cache_key } = openaiReq;
 
-  // 提取系统提示，OpenAI 的 system 与 developer 均映射为系统提示
-  // 数组型 content 必须展开取 text 后拼成「字符串」，而不是转成 JSON 字符串，
-  // 更不能输出 Anthropic 风格的 content 块数组：CC 上游要求 params.system 恒为
-  // 字符串，传数组会被直接拒绝（真机验证：
-  // Validation error: Invalid input: expected string, received array at "params.system"）。
+  // 提取系统提示：OpenAI 的 system / developer 都映射为系统提示。
+  // 形态对齐 CLI 的 toWireSystem —— **块数组**，非最后一块补 \n，cache_control 逐块保留。
+  // （CLI 的 composeSystemPrompt：基础提示词是字符串时发字符串、是 sections 时发块数组；
+  //   真机验证两种形态服务端都接受，见 PROTOCOL-FACTS-1.53.1.md。这里统一用块数组，
+  //   才能把客户端标在 system 上的缓存断点原样送上去。）
   const systemMsgs = messages.filter(m => m.role === 'system' || m.role === 'developer');
-  const systemPrompt = systemMsgs.map(m => {
-    if (typeof m.content === 'string') return m.content;
-    if (Array.isArray(m.content)) return m.content.map(c => c?.text ?? c?.content ?? '').join('\n');
-    return m.content == null ? '' : String(m.content);
-  }).join('\n');
+  const systemBlocks = [];
+  for (const m of systemMsgs) {
+    if (typeof m.content === 'string') {
+      if (m.content) systemBlocks.push({ type: 'text', text: m.content });
+    } else if (Array.isArray(m.content)) {
+      for (const c of m.content) {
+        const text = c?.text ?? c?.content ?? '';
+        if (text === '' && !c?.cache_control) continue;
+        const block = { type: 'text', text: String(text) };
+        if (c?.cache_control) block.cache_control = c.cache_control;
+        systemBlocks.push(block);
+      }
+    } else if (m.content != null) {
+      systemBlocks.push({ type: 'text', text: String(m.content) });
+    }
+  }
+  for (let i = 0; i < systemBlocks.length - 1; i++) systemBlocks[i].text += '\n';
   const chatMessages = messages.filter(m => m.role !== 'system' && m.role !== 'developer');
 
   // Build tool_call_id → tool_name reverse lookup
@@ -466,8 +502,11 @@ function buildCcRequest(openaiReq) {
         const parts = msg.content.map(part => {
           if (part.type === 'image_url') {
             const url = part.image_url?.url || '';
-            // CC CLI 真实格式: { type: "image", image: "data:image/jpeg;base64,..." }
-            return { type: 'image', image: url };
+            // CC CLI 真实格式: { type: "image", image: "data:<mime>;base64,...", mimeType: "<mime>" }
+            const mediaType = /^data:([^;,]+)/.exec(url)?.[1];
+            const imagePart = { type: 'image', image: url };
+            if (mediaType) imagePart.mimeType = mediaType;
+            return imagePart;
           }
           return part;
         }).filter(Boolean);
@@ -513,7 +552,7 @@ function buildCcRequest(openaiReq) {
           type: 'tool-result',
           toolCallId: msg.tool_call_id,
           toolName: toolNameMap[msg.tool_call_id] || msg.name || '',
-          output: { type: 'text', value: typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content) },
+          output: { type: 'text', value: toWireToolOutputValue(msg.content) },
         }],
       };
     }
@@ -521,21 +560,21 @@ function buildCcRequest(openaiReq) {
     return { role: 'user', content: [{ type: 'text', text: String(msg.content ?? '') }] };
   });
 
-  const hasMessageCacheMarker = ccMessages.some(msg =>
+  // 缓存断点：system 是块数组，断点可以原样留在 system 上（CLI 的 systemSections[].cache 同义）。
+  // 客户端已在任意消息块 / system 块上打过断点就保留；否则若给了 OpenAI 系的 prompt_cache_key，
+  // 把断点落在 system 最后一块 —— 缓存按前缀计算，system 正是最前的那段前缀。
+  const hasCacheMarker = systemBlocks.some(b => b.cache_control) || ccMessages.some(msg =>
     Array.isArray(msg.content) && msg.content.some(part => part?.cache_control));
-  if (prompt_cache_key && !hasMessageCacheMarker) {
-    const firstUserMessage = ccMessages.find(msg => msg.role === 'user' && Array.isArray(msg.content));
-    const cacheBoundary = firstUserMessage?.content.findLast(part => part?.type === 'text');
-    if (cacheBoundary) cacheBoundary.cache_control = { type: 'ephemeral' };
+  if (prompt_cache_key && !hasCacheMarker && systemBlocks.length) {
+    systemBlocks[systemBlocks.length - 1].cache_control = { type: 'ephemeral' };
   }
-
-  const threadId = newThreadId();
 
   const body = {
     config: {
-      workingDir: process.cwd(),
+      // 伪造的项目目录（不再发宿主真实 cwd）；environment 用伪装的平台词，与指纹保持自洽
+      workingDir: DEVICE_PROFILE.projectDir,
       date: getDateStr(),
-      environment: getEnvironment(),
+      environment: DEVICE_PROFILE.platform,
       structure: [],
       isGitRepo: false,
       currentBranch: '',
@@ -545,8 +584,10 @@ function buildCcRequest(openaiReq) {
     },
     memory: null,
     taste: null,
-    skills: '',
+    skills: null,          // CLI 发 null，不是空串
     permissionMode: 'standard',
+    mode: CFG.cliMode || 'agent',
+    // threadId 需为合法 UUID，否则整键省略（CLI 的 toWireThreadId）—— 在 forwardToCC 拿到 sessionId 后补
     params: {
       model: model || 'deepseek/deepseek-v4-flash',
       messages: ccMessages,
@@ -556,8 +597,8 @@ function buildCcRequest(openaiReq) {
   };
 
   // 条件字段
-  if (systemPrompt) {
-    body.params.system = systemPrompt;
+  if (systemBlocks.length) {
+    body.params.system = systemBlocks;
   } else if (CFG.emptySystemPlaceholder) {
     // CC 上游在 params.system 缺省时会注入自身约 7.5K token 的默认提示词（进入
     // 默认上下文/前缀路径），既产生大量 cached tokens 又污染对话（模型会以为
@@ -565,7 +606,7 @@ function buildCcRequest(openaiReq) {
     // 真机验证 prompt_tokens 从 7653 降到 85。
     // 默认开启；config.json 设 "emptySystemPlaceholder": false 或环境变量
     // CC_EMPTY_SYSTEM_PLACEHOLDER=false 可关闭（回到原生的缺省行为）。
-    body.params.system = ' ';
+    body.params.system = [{ type: 'text', text: ' ' }];
   }
   if (temperature !== undefined) {
     body.params.temperature = temperature;
@@ -573,14 +614,13 @@ function buildCcRequest(openaiReq) {
   if (reasoning_effort !== undefined) {
     body.params.reasoning_effort = reasoning_effort;
   }
-  if (tools && tools.length > 0) {
-    body.params.tools = tools.map(t => ({
-      type: t.type || 'function',
-      name: t.function?.name || t.name || '',
+  // CLI 总是下发 tools（没有工具时是空数组）—— 空数组与缺键在 wire 上可观测，这里对齐
+  // CLI 的 toWireTools：只有 name / description / input_schema，没有 type 字段
+  body.params.tools = (tools || []).map(t => ({
+      name: toWireToolName(t.function?.name || t.name || ''),
       description: t.function?.description || t.description || '',
       input_schema: t.function?.parameters || t.input_schema || { type: 'object', properties: {} },
     }));
-  }
   if (tool_choice !== undefined) {
     // OpenAI 格式 → CC (Anthropic 风格) 格式
     if (typeof tool_choice === 'string') {
@@ -600,6 +640,24 @@ function buildCcRequest(openaiReq) {
   return body;
 }
 
+// CLI 发送前会重写部分工具名（resolveToolNameAlias / ow 表）
+const TOOL_NAME_ALIASES = {
+  bash_output: 'shell_output',
+  task_output: 'shell_output',
+  tool_search: 'search_tools',
+  read_multiple_files: 'read_file',
+};
+function toWireToolName(name) { return TOOL_NAME_ALIASES[name] || name; }
+
+// CLI 的 toWireToolOutput：只取文本块，用 '\n' 拼接
+function toWireToolOutputValue(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.filter(c => c && c.type === 'text').map(c => c.text ?? '').join('\n');
+  }
+  return content == null ? '' : String(content);
+}
+
 function tryParseJSON(str) {
   try { return JSON.parse(str); } catch { return {}; }
 }
@@ -607,6 +665,8 @@ function tryParseJSON(str) {
 // ── CC NDJSON → OpenAI SSE 转换 ────────────────────
 
 function createSseTranslator(model, completionId, created) {
+  // 是否见过终态 finish 事件。CLI 用同一个标志判定「流是不是被截断了」。
+  let sawFinish = false;
   let chunkIndex = 0;
   let sentRole = false;
   let finishReason = null;
@@ -675,6 +735,7 @@ function createSseTranslator(model, completionId, created) {
         }
 
         case 'finish-step': {
+          sawFinish = true;
           if (event.finishReason) finishReason = mapFinishReason(event.finishReason);
           if (event.usage) {
             usage = event.usage;
@@ -686,7 +747,8 @@ function createSseTranslator(model, completionId, created) {
         }
 
         case 'finish': {
-          const fr = finishReason || mapFinishReason(event.finishReason || 'stop');
+          sawFinish = true;
+          const fr = toOpenAIFinishReason(finishReason || mapFinishReason(event.finishReason || 'stop'));
           const u = event.totalUsage || usage || {};
           normalizeUsage(u);
           this.inputTokens = u.inputTokens ?? 0;
@@ -704,8 +766,16 @@ function createSseTranslator(model, completionId, created) {
 
         case 'error': {
           const msg = event.error?.message || event.message || 'Unknown error';
-          log('warn', 'CC stream error', { message: msg });
           this.upstreamError = mapCcEventError(event);
+          // 先映射再记日志，并把上游自带的状态/可重试性一并打出 ——
+          // 排查容量/限流类问题时，真正需要的就是这两个字段
+          log('warn', 'CC stream error', {
+            message: msg,
+            upstreamStatus: this.upstreamError.reportedStatus,
+            upstreamRetryable: event.error?.isRetryable,
+            code: this.upstreamError.code,
+            mappedTo: this.upstreamError.status,
+          });
           // Don't emit a finish_reason chunk — let the natural stream termination
           // handle it. Otherwise a subsequent finish(tool_calls) would be ignored
           // by downstream agent loops that stop at the first finish_reason.
@@ -721,6 +791,11 @@ function createSseTranslator(model, completionId, created) {
       }
 
       return out.length > 0 ? out : null;
+    },
+
+    /** 这次上游流若没有正常走完 finish，返回可读原因；正常则为 null。 */
+    incompleteDetail() {
+      return incompleteUpstreamDetail(sawFinish, finishReason);
     },
 
     /** 获取 SSE 结束标记 */
@@ -771,13 +846,56 @@ function anthropicInputTokens(usage, noCacheOverride) {
   return Math.max(0, (u.inputTokens || 0) - cacheRead - cacheWrite);
 }
 
+// 上游 finishReason → 本代理内部规范化取值。
+// 对齐 CLI 的 normalizeStopReason2 / isNetworkFailureFinish（command-code@1.54.0）：
+//   tool_use | tool-calls | tool_calls                    → tool_calls
+//   length | max_tokens | max_output_tokens
+//          | model_context_window_exceeded                → length
+//   /^(network|connection|upstream)[-_\s]?error$/i        → upstream_error
+//   pause_turn                                            → pause_turn（原样保留）
+// 关键点：'length' 家族**不止 'length' 一个值**。max_output_tokens 与
+// model_context_window_exceeded 都是「输出被截断」，折成 stop/end_turn 等于
+// 把半截回答谎报成完整回答。未知值一律原样返回，宁可让它露出来也不要静默折成 stop。
 function mapFinishReason(reason) {
-  switch (reason) {
-    case 'tool-calls': return 'tool_calls';
-    case 'length': return 'length';
-    case 'stop': return 'stop';
-    default: return reason || 'stop';
-  }
+  const r = String(reason ?? '').trim().toLowerCase();
+  if (!r) return 'stop';
+  if (r === 'tool-calls' || r === 'tool_calls' || r === 'tool_use') return 'tool_calls';
+  if (r === 'length' || r === 'max_tokens'
+      || r === 'max_output_tokens' || r === 'model_context_window_exceeded') return 'length';
+  if (/^(?:network|connection|upstream)[-_\s]?error$/.test(r)) return 'upstream_error';
+  return r;
+}
+
+// 上游「没有正常走完」的两种情形，CLI 都当成可重试的 502：
+//   · 流里根本没有 finish 事件 —— "Stream ended unexpectedly before completion
+//     (no finish event) — response was truncated"
+//   · provider 报 network/connection/upstream-error —— isNetworkFailureFinish
+// 返回 null 表示这次流是正常结束的。
+//
+// sawFinish 的口径是「上游给过任何完成信号」：终态 finish，以及本代理一直在处理的
+// finish-step。（'finish-step' 在 CLI 的事件集里不存在 —— 见 proxy.mjs 各处注释 ——
+// 但既然代理认它，就不能让它变成「没完成」，否则会把原本正常的响应误判成 502。
+// 真正要拦的是「一个完成信号都没有就断了」。）
+function incompleteUpstreamDetail(sawFinish, finishReason) {
+  if (!sawFinish) return 'no finish event';
+  if (finishReason === 'upstream_error') return 'provider reported an upstream connection failure';
+  return null;
+}
+
+function incompleteUpstreamError(detail) {
+  return {
+    status: 502,
+    // retry_after 同时放在 body 里与顶层：sendJSON 只发 body，
+    // 而 sendAnthropicError / sendResponsesError 需要单独的形参。
+    body: {
+      error: {
+        message: `Upstream stream ended without a completion finish (${detail}) — response was truncated`,
+        type: 'upstream_error',
+      },
+      retry_after: 10,
+    },
+    retry_after: 10,
+  };
 }
 
 // ── 错误映射 ───────────────────────────────────────
@@ -796,35 +914,45 @@ const CC_STATUS_MAP = {
 
 function mapCcError(ccStatus, ccBody) {
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
-  let message = `CC API error (${ccStatus})`;
-
+  const context = requestContext.getStore();
+  if (context) context.status = ccStatus;
+  let code = null;
   if (ccBody) {
     try {
       const parsed = JSON.parse(ccBody);
-      message = parsed.error?.message || parsed.message || message;
-    } catch {
-      message = ccBody.slice(0, 200) || message;
-    }
+      // 上游错误体：{"success":false,"error":{"code":"BAD_REQUEST"|"USAGE_EXCEEDED",...}}
+      // 只透出机器可读 code；原始 message 可能含凭证，响应体仍用泛化文案。
+      code = parsed.error?.code || parsed.code || null;
+    } catch {}
   }
-
-  // CC 429 响应可能带 retry-after
-  if (ccStatus === 429) {
+  const message = `Upstream request failed (HTTP ${ccStatus})`;
+  if (mapped.status === 429) {
     return {
       status: 429,
+      code,
       body: {
-        error: { message, type: 'rate_limit_error' },
+        error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) },
         retry_after: 30,
       },
     };
   }
-
-  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+  return { status: mapped.status, code, body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 function mapCcEventError(event) {
-  const message = event.error?.message || event.message || 'Unknown CC error';
+  const message = event.error?.message || event.message || '';
+  const code = event.error?.code || event.code || null;
+  // 上游 error 事件除了 message 还可能自带 statusCode / isRetryable ——
+  // CLI 的 readStreamErrorEvent 读的正是这两个字段，取值链是
+  //   parseEmbeddedErrorJSON(message)?.status ?? error.statusCode ?? null
+  // 原实现只看 message 里的 "<NNN>" 前缀，statusCode 一律被丢掉，
+  // 于是 429 / 503 这类「该退避重试」的信号在代理这一层被抹平成 502「服务端错误」：
+  // 客户端不再按限流退避，监控也会把它错误归类成后端故障。
   const statusMatch = message.match(/^<(\d{3})>/);
-  const ccStatus = statusMatch ? Number(statusMatch[1]) : 502;
+  const reportedStatus = statusMatch
+    ? Number(statusMatch[1])
+    : (Number.isInteger(event.error?.statusCode) ? event.error.statusCode : null);
+  const ccStatus = reportedStatus ?? 502;
   const mapped = CC_STATUS_MAP[ccStatus] || { status: 502, type: 'upstream_error' };
 
   // 与 mapCcError 保持一致：终态为 429 时带上 retry_after，
@@ -832,16 +960,20 @@ function mapCcEventError(event) {
   if (mapped.status === 429) {
     return {
       status: 429,
-      body: { error: { message, type: 'rate_limit_error' }, retry_after: 30 },
+      code,
+      reportedStatus,
+      body: { error: { message, type: 'rate_limit_error', ...(code ? { code } : {}) }, retry_after: 30 },
     };
   }
 
-  return { status: mapped.status, body: { error: { message, type: mapped.type } } };
+  return { status: mapped.status, code, reportedStatus,
+    body: { error: { message, type: mapped.type, ...(code ? { code } : {}) } } };
 }
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
 function readBody(req) {
+  if (req.parsedBody) return Promise.resolve(req.parsedBody);
   return new Promise((resolve, reject) => {
     const chunks = [];
     let totalSize = 0;
@@ -951,19 +1083,28 @@ function getApiKey(headers) {
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
-  const url = `${CFG.apiBase}/alpha/generate`;
   const traceparent = generateTraceparent();
   const sessionId = getSessionId(incomingHeaders, apiKey, promptCacheKey);
+  // CLI 的 toWireThreadId：只有合法 UUID 才放进信封，否则整个键省略。
+  // 同时按 CLI 的键顺序重排：config, memory, taste, skills, permissionMode, threadId, mode, params
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(sessionId))) {
+    const ordered = {};
+    for (const k of ['config', 'memory', 'taste', 'skills', 'permissionMode']) ordered[k] = body[k];
+    ordered.threadId = sessionId;
+    for (const k of ['mode', 'promptCache', 'params']) if (k in body) ordered[k] = body[k];
+    body = ordered;
+  }
 
+  // 与 CLI 的 buildCommandAuthHeaders 对齐：没有 x-co-flag；User-Agent 固定 "cli"
   const headers = {
     'Content-Type': 'application/json',
-    'Authorization': `Bearer ${apiKey}`,
-    'x-cli-environment': 'production',
+    'User-Agent': 'cli',
     'x-command-code-version': CC_VERSION,
-    'x-session-id': sessionId,
-    'x-co-flag': 'false',
+    'x-cli-environment': 'production',
+    'x-project-slug': slugifyProjectPath(DEVICE_PROFILE.projectDir),
     'x-taste-learning': 'false',
-    'x-project-slug': fakeProjectSlug(sessionId),
+    'x-session-id': sessionId,
+    'Authorization': `Bearer ${apiKey}`,
     'traceparent': traceparent,
   };
 
@@ -971,12 +1112,19 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
     headers['x-cmd-zdr'] = '1';
   }
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
+  const context = requestContext.getStore();
+  if (context) context.dispatched = true;
+  let response;
+  try {
+    response = await fetch(`${context?.apiBase || CFG.apiBase}/alpha/generate`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+      signal: context?.signal ? AbortSignal.any([signal, context.signal].filter(Boolean)) : signal,
+    });
+  } catch {
+    if (context) context.status = 0;
+    throw new Error('Upstream network request failed');
+  }
+  if (context) { context.status = response.status; context.retryAfter = response.headers.get('retry-after'); context.onConnected?.(); }
 
   return response;
 }
@@ -1027,8 +1175,8 @@ async function handleChatCompletions(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendJSON(res, mapped.status, mapped.body);
       return;
     }
@@ -1140,6 +1288,18 @@ async function handleChatCompletions(req, res) {
               return;
             }
             try { res.write(`data: ${JSON.stringify(translator.upstreamError.body)}\n\n`); } catch {}
+          // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
+          // 不能补一个 finish_reason 就 [DONE] —— 那等于把截断谎报成完整回答。
+          // 对齐 CLI：这一族一律按可重试的 502 处理。
+          // 必须排在零输出判定之前 —— 上游压根没发 finish 时，「no finish event」才是根因，
+          // 零输出只是它的表象（此时按 429 报会掩盖真实原因）。
+          } else if (translator.incompleteDetail()) {
+            const detail = translator.incompleteDetail();
+            log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: detail });
+            const err = incompleteUpstreamError(detail);
+            try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+            if (!started) { sendJSON(res, err.status, err.body); return; }
+            try { res.write(`data: ${JSON.stringify(err.body)}\n\n`); } catch {}
           // 输出 token 为 0 时记为错误，避免下游异常计费
           } else if (translator.outputTokens === 0) {
             try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1190,8 +1350,12 @@ async function handleChatCompletions(req, res) {
             return;
           }
           if (!res.writableEnded) {
-            try { res.write(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            // 必须 end() 而不是 destroy()：res.write 是异步的，紧接着 destroy 会把尚未
+            // 刷出的缓冲丢掉并发 RST。反向代理看到上游连接被重置，要么回 502，要么让
+            // 客户端看到 connection error —— 这正是"吐字慢 + 间歇性 502"的成因之一。
+            // end() 会把错误事件正常送进 SSE 流再发 FIN，客户端 SDK 能按可重试错误处理。
+            // 下游若已僵死（不读也不断），由 CLIENT_DRAIN_TIMEOUT_MS 那条路径负责兜底。
+            try { res.end(`data: ${JSON.stringify({ error: { message: timeoutMsg, type: 'rate_limit_error' }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
           log('error', 'Stream error', { message: e.message });
@@ -1213,6 +1377,7 @@ async function handleChatCompletions(req, res) {
       // ── 非流式响应（缓冲完整 NDJSON）──
       let reasoningContent = '';
       let finishReason = 'stop';
+      let sawFinish = false;
       let usage = null;
       let toolCalls = null;
       let upstreamError = null;
@@ -1244,17 +1409,32 @@ async function handleChatCompletions(req, res) {
                   },
                 });
                 break;
+              case 'finish-step':
               case 'finish':
                 lastCcEvent = event.type;
+                sawFinish = true;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage) usage = event.totalUsage;
                 break;
               case 'error':
                 lastCcEvent = event.type;
-                log('warn', 'CC stream error (non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
+                log('warn', 'CC stream error (non-stream)', {
+                  message: event.error?.message || event.message,
+                  upstreamStatus: upstreamError.reportedStatus,
+                  upstreamRetryable: event.error?.isRetryable,
+                  code: upstreamError.code,
+                  mappedTo: upstreamError.status,
+                });
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              // 无内容的事件：与流式翻译器的静默列表保持一致。
+              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+              case 'text-start': case 'text-end': case 'start': case 'start-step':
+              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'tool-error':
                 // Silent - no user-visible content
                 break;
               default:
@@ -1284,6 +1464,16 @@ async function handleChatCompletions(req, res) {
         return;
       }
 
+      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+      const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (incomplete) {
+        log('warn', 'Upstream stream incomplete', { path: '/v1/chat/completions', reason: incomplete });
+        const err = incompleteUpstreamError(incomplete);
+        try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+        sendJSON(res, err.status, err.body);
+        return;
+      }
+
       // 输出 token 为 0 时记为错误，避免下游异常计费
       if ((usage?.outputTokens ?? 0) === 0) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
@@ -1304,7 +1494,7 @@ async function handleChatCompletions(req, res) {
             toolCalls ? { tool_calls: toolCalls } : {},
             reasoningContent ? { reasoning_content: reasoningContent } : {},
           ),
-          finish_reason: finishReason,
+          finish_reason: toOpenAIFinishReason(finishReason),
         }],
     usage: (() => {
       if (!usage) usage = {};
@@ -1360,8 +1550,20 @@ function mapAnthropicStopReason(finishReason) {
     case 'tool_calls': return 'tool_use';
     case 'length': return 'max_tokens';
     case 'stop': return 'end_turn';
+    // Anthropic 的原生枚举，必须原样透出：它表示「这一轮被暂停，后面还有内容」。
+    // 折成 end_turn 会让下游把半截回答当成写完了（CLI 是靠自动续写把它吸收掉的，
+    // 代理不自动续写，就必须如实上报，不能吞掉）。
+    case 'pause_turn': return 'pause_turn';
+    case 'refusal': return 'refusal';
     default: return 'end_turn';
   }
+}
+
+// OpenAI 的 finish_reason 只有 stop | length | tool_calls | content_filter | function_call。
+// pause_turn 没有对应值：折成 'stop' 是谎报完成（正是要修的问题），
+// 折成 'length' 至少如实表达了「输出不完整」，下游的截断处理会做对的事。
+function toOpenAIFinishReason(finishReason) {
+  return finishReason === 'pause_turn' ? 'length' : finishReason;
 }
 
 // Generate a Claude-format fake signature for thinking blocks.
@@ -1415,14 +1617,20 @@ function buildAnthropicResponse(model, fullText, toolCalls, finishReason, usage,
 function convertAnthropicToOpenAI(anthropicReq) {
   // 1. Extract system prompt (top-level, not in messages array)
   let systemPrompt = '';
+  let systemBlocks = null;
   if (anthropicReq.system) {
     if (typeof anthropicReq.system === 'string') {
       systemPrompt = anthropicReq.system;
     } else if (Array.isArray(anthropicReq.system)) {
-      systemPrompt = anthropicReq.system
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
+      // 保留 cache_control：buildCcRequest 需要块数组才能把断点下发（CLI 的 params.system 就是块数组）
+      systemBlocks = anthropicReq.system
+        .filter(b => b && b.type === 'text')
+        .map(b => {
+          const blk = { type: 'text', text: b.text ?? '' };
+          if (b.cache_control) blk.cache_control = b.cache_control;
+          return blk;
+        });
+      systemPrompt = systemBlocks.map(b => b.text).join('\n');
     }
   }
 
@@ -1431,7 +1639,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
   const openaiMessages = [];
 
   if (systemPrompt) {
-    openaiMessages.push({ role: 'system', content: systemPrompt });
+    openaiMessages.push({ role: 'system', content: systemBlocks && systemBlocks.length ? systemBlocks : systemPrompt });
   }
 
   const messages = anthropicReq.messages || [];
@@ -1441,11 +1649,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
       // Anthropic 的 thinking block 承载思考内容，需转成 reasoning_content
       // 交给 buildCcRequest 回传，否则 CC 会因缺少 reasoning 而拒绝
       let thinkingContent = '';
+      const textParts = [];
+      let textHasCache = false;
       const toolCalls = [];
       const blocks = Array.isArray(msg.content) ? msg.content : [{ type: 'text', text: msg.content || '' }];
       for (const block of blocks) {
         if (block.type === 'text') {
           textContent += block.text || '';
+          const part = { type: 'text', text: block.text || '' };
+          if (block.cache_control) { part.cache_control = block.cache_control; textHasCache = true; }
+          textParts.push(part);
         } else if (block.type === 'thinking') {
           thinkingContent += block.thinking || '';
         } else if (block.type === 'tool_use') {
@@ -1460,12 +1673,15 @@ function convertAnthropicToOpenAI(anthropicReq) {
           });
         }
       }
-      const assistantMsg = { role: 'assistant', content: textContent || null };
+      const assistantMsg = { role: 'assistant', content: (textParts.length > 1 || textHasCache) ? textParts : (textContent || null) };
       if (thinkingContent) assistantMsg.reasoning_content = thinkingContent;
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls;
       openaiMessages.push(assistantMsg);
     } else if (msg.role === 'user') {
       let textContent = '';
+      // parts 保持原始顺序（text / image_url），与 CLI 的 toWireMessages 一致
+      const parts = [];
+      let textHasCache = false;
       const toolResults = [];
       if (typeof msg.content === 'string') {
         textContent = msg.content;
@@ -1473,6 +1689,16 @@ function convertAnthropicToOpenAI(anthropicReq) {
         for (const block of msg.content) {
           if (block.type === 'text') {
             textContent += block.text || '';
+            const part = { type: 'text', text: block.text || '' };
+            if (block.cache_control) { part.cache_control = block.cache_control; textHasCache = true; }
+            parts.push(part);
+          } else if (block.type === 'image') {
+            // Anthropic 图片块：{ type:'image', source:{ type:'base64', media_type, data } } 或 source.url
+            const s = block.source || {};
+            const url = s.type === 'base64' && s.data
+              ? `data:${s.media_type || 'image/png'};base64,${s.data}`
+              : (s.url || '');
+            if (url) parts.push({ type: 'image_url', image_url: { url } });
           } else if (block.type === 'tool_result') {
             toolResults.push(block);
           }
@@ -1484,7 +1710,7 @@ function convertAnthropicToOpenAI(anthropicReq) {
       }
       for (const tr of toolResults) {
         const toolContent = typeof tr.content === 'string' ? tr.content
-          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('')
+          : Array.isArray(tr.content) ? tr.content.map(c => c.text || '').join('\n')
           : String(tr.content || '');
         // OpenAI 语义里 tool 消息的 name 是可选的；会话恢复等场景下 tool_use_id 可能
         // 找不到对应 assistant tool_use（历史被客户端裁剪），此时不硬塞空 name，
@@ -1493,8 +1719,11 @@ function convertAnthropicToOpenAI(anthropicReq) {
         if (toolNameFromId[tr.tool_use_id]) toolMsg.name = toolNameFromId[tr.tool_use_id];
         openaiMessages.push(toolMsg);
       }
-      if (textContent) {
-        openaiMessages.push({ role: 'user', content: textContent });
+      if (parts.length || textContent) {
+        // 单块纯文本仍用字符串（线格不变）；多块 / 带断点 / 含图片时用块数组（CLI 的形态）。
+        // 注意：content 为字符串时 parts 为空，必须用 textContent 判空（否则整条消息会丢）
+        const singleText = parts.length <= 1 && (parts.length === 0 || parts[0].type === 'text') && !textHasCache;
+        openaiMessages.push({ role: 'user', content: singleText ? textContent : parts });
       }
     }
   }
@@ -1572,6 +1801,11 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
   let cacheWriteTokens = 0;
   let noCacheTokens = -1;   // -1 = 上游未提供该字段，改用减法兜底
   let stopReason = null;
+  // 归一化后的 finishReason（mapAnthropicStopReason 之前的值），用于判定「是否正常结束」
+  let finishNorm = null;
+  // 是否见过终态 finish 事件。CLI 用同一个标志判定流是否被截断 —— 它只认 'finish'，
+  // 'finish-step' 不在 CLI 的事件集里，故这里同样只认 'finish'。
+  let sawFinish = false;
   let hasError = false;
   let currentThinkingText = ''; // accumulated thinking text for the open block
 
@@ -1702,7 +1936,14 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
 
           case 'finish-step':
           case 'finish': {
-            if (event.finishReason) stopReason = mapAnthropicStopReason(event.finishReason);
+            // 上游的 finishReason 是 'tool-calls'（连字符），必须先过 mapFinishReason 规范化成
+            // 'tool_calls'，否则会掉进 mapAnthropicStopReason 的 default 变成 end_turn。
+            // 真机实测踩到过：工具调用成功但 stop_reason 报 end_turn。
+            sawFinish = true;   // finish-step 与 finish 都算完成信号
+            if (event.finishReason) {
+              finishNorm = mapFinishReason(event.finishReason);
+              stopReason = mapAnthropicStopReason(finishNorm);
+            }
             const u = event.totalUsage || event.usage;
             if (u) {
               normalizeUsage(u);
@@ -1753,8 +1994,15 @@ async function* createAnthropicSseTranslator(response, model, messageId, ctx) {
       const closeBlock = closeTextBlock();
       if (closeBlock) yield closeBlock;
 
+      // 上游没有正常走完 finish（无 finish 事件 / provider 报连接失败）：
+      // 绝不能补一个 end_turn 就 message_stop —— 那等于把截断谎报成完整回答。
+      // 对齐 CLI：这一族一律按可重试错误处理。
+      const incomplete = incompleteUpstreamDetail(sawFinish, finishNorm);
+      if (incomplete) {
+        log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+        yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: incompleteUpstreamError(incomplete).body.error })}\n\n`;
       // 输出 token 为 0 时记为错误，避免下游异常计费
-      if (outputTokens === 0) {
+      } else if (outputTokens === 0) {
         yield `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Empty response from upstream (zero output tokens)' }, retry_after: 10 })}\n\n`;
       } else {
         yield `event: message_delta\ndata: ${JSON.stringify({
@@ -1833,8 +2081,8 @@ async function handleMessages(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error (Anthropic)', { status: ccResponse.status });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error (Anthropic)', { status: ccResponse.status, code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendAnthropicError(res, mapped.status, mapped.body.error.type, mapped.body.error.message);
       return;
     }
@@ -1973,8 +2221,8 @@ async function handleMessages(req, res) {
             const timeoutMsg = consecutiveTimeouts >= TIMEOUT_REDUCE_CONTEXT_THRESHOLD
               ? 'Response timeout - try reducing context length (summarize earlier messages)'
               : 'Response timeout - request timed out';
-            try { res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
-            try { res.destroy(); } catch {}
+            // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
+            try { res.end(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: timeoutMsg }, retry_after: 5 })}\n\n`); } catch {}
           }
         } else {
           log('error', 'Anthropic stream error', { message: e.message });
@@ -1998,6 +2246,7 @@ async function handleMessages(req, res) {
       // ── 非流式 Anthropic JSON ──
       const messageId = 'msg_' + randomUUID().slice(0, 12);
       let finishReason = 'stop';
+      let sawFinish = false;
       let usage = null;
       let toolCalls = null;
       let thinkingText = ''; // CC reasoning → Anthropic thinking block
@@ -2029,17 +2278,32 @@ async function handleMessages(req, res) {
                   },
                 });
                 break;
+              case 'finish-step':
               case 'finish':
                 lastCcEvent = event.type;
+                sawFinish = true;
                 finishReason = mapFinishReason(event.finishReason || 'stop');
                 if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
                 break;
               case 'error':
                 lastCcEvent = event.type;
-                log('warn', 'CC error (Anthropic non-stream)', { message: event.error?.message || event.message });
                 upstreamError = mapCcEventError(event);
+                log('warn', 'CC error (Anthropic non-stream)', {
+                  message: event.error?.message || event.message,
+                  upstreamStatus: upstreamError.reportedStatus,
+                  upstreamRetryable: event.error?.isRetryable,
+                  code: upstreamError.code,
+                  mappedTo: upstreamError.status,
+                });
                 break;
-              case 'reasoning-end': case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end': case 'tool-error': case 'text-end':
+              // 无内容的事件：与流式翻译器的静默列表保持一致。
+              // text-start / start / start-step / reasoning-start 原先只在流式路径被识别，
+              // 非流式路径会掉进 default 打成 'Unknown CC event type' —— 上游每个响应都会发，
+              // 于是线上刷屏。它们本身不携带内容（内容在 text-delta），纯粹是噪音。
+              case 'text-start': case 'text-end': case 'start': case 'start-step':
+              case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+              case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+              case 'tool-error':
                 // Silent - no user-visible content
                 break;
               default:
@@ -2067,6 +2331,18 @@ async function handleMessages(req, res) {
       if (upstreamError) {
         sendAnthropicError(res, upstreamError.status, upstreamError.body.error.type, upstreamError.body.error.message);
         return;
+      }
+
+      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+      {
+        const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+        if (incomplete) {
+          log('warn', 'Upstream stream incomplete', { path: '/v1/messages', reason: incomplete });
+          const err = incompleteUpstreamError(incomplete);
+          try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+          sendAnthropicError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+          return;
+        }
       }
 
       // 零输出判定改为按实际内容：上游偶发不回 totalUsage 时，旧逻辑（usage?.outputTokens ?? 0 === 0）
@@ -2113,50 +2389,6 @@ async function handleMessages(req, res) {
       sendAnthropicError(res, 502, 'proxy_error', `Upstream error: ${e.message}`, 10);
     }
   }
-}
-
-// ── 动态模型列表 ────────────────────────────────────
-
-let dynamicModels = null;
-let modelsLastFetch = 0;
-
-async function fetchModels(apiKey) {
-  const now = Date.now();
-  if (dynamicModels && (now - modelsLastFetch) < CFG.modelRefreshIntervalMs) {
-    return dynamicModels;
-  }
-
-  try {
-    if (!apiKey || !CFG.useProviderModels) throw new Error('Provider models disabled');
-
-    const response = await fetch(`${CFG.apiBase}/provider/v1/models`, {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-      },
-      signal: AbortSignal.timeout(10000),
-    });
-
-    if (response.ok) {
-      const data = await response.json();
-      if (Array.isArray(data.data)) {
-        dynamicModels = data.data.map(m => ({
-          id: m.id,
-          name: m.id,
-        }));
-        modelsLastFetch = now;
-        log('info', 'Fetched models from Provider API', { count: dynamicModels.length });
-        return dynamicModels;
-      }
-    }
-    log('warn', 'Provider models fetch failed, using hardcoded list', { status: response.status });
-  } catch (e) {
-    log('warn', 'Provider models fetch error, using hardcoded list', { error: e.message });
-  }
-
-  // Fallback to hardcoded MODELS
-  return MODELS;
 }
 
 // ── OpenAI Responses API（/v1/responses）──────────────
@@ -2209,7 +2441,13 @@ function convertResponsesToChat(respReq) {
   } else if (Array.isArray(input)) {
     for (const item of input) {
       if (!item || typeof item !== 'object') continue;
-      switch (item.type) {
+      // OpenAI 规范里 input 数组的联合类型第一个成员是 EasyInputMessage，它的
+      // required 只有 role 与 content —— type 是可选的（官方文档与 SDK 示例普遍写作
+      // { role: 'user', content: 'hi' }）。item.type 为 undefined 但有 role 时按
+      // message 处理，否则这类 item 会落进 default 被丢弃：全部省略时只剩
+      // "input is required" 的误导性报错；混合形态时更糟 —— 校验能过，用户在
+      // HTTP 200 下静默丢消息。这里只在 type 缺失时兜底，带 type 的 item 判定不变。
+      switch (item.type ?? (item.role ? 'message' : undefined)) {
         case 'reasoning': {
           const t = responsesReasoningOf(item);
           if (t) ensurePending().reasoning_content = t;
@@ -2245,7 +2483,10 @@ function convertResponsesToChat(respReq) {
           });
           break;
         }
-        default: break;
+        default: {
+          log('warn', 'Unknown Responses input item type', { type: item.type });
+          break;
+        }
       }
     }
   }
@@ -2329,14 +2570,16 @@ function buildResponsesOutput(fullText, thinkingText, toolCalls) {
 function buildResponsesObject(responseId, model, created, fullText, thinkingText, toolCalls, usage, opts) {
   const o = opts || {};
   const truncated = o.finishReason === 'length';
+  const paused = o.finishReason === 'pause_turn';
   return {
     id: responseId,
     object: 'response',
     created_at: created,
-    status: truncated ? 'incomplete' : 'completed',
+    status: (truncated || paused) ? 'incomplete' : 'completed',
     completed_at: nowUnix(),
     error: null,
-    incomplete_details: truncated ? { reason: 'max_output_tokens' } : null,
+    incomplete_details: truncated ? { reason: 'max_output_tokens' }
+      : paused ? { reason: 'pause_turn' } : null,
     input: o.input || [],
     instructions: o.instructions === undefined ? null : o.instructions,
     max_output_tokens: o.max_output_tokens === undefined ? null : o.max_output_tokens,
@@ -2376,6 +2619,8 @@ function createResponsesSseTranslator(model, responseId, created) {
   let usage = null;
   let textAcc = '';
   let finishReason = null;
+  // 是否见过完成信号（见 incompleteUpstreamDetail 的口径说明）
+  let sawFinish = false;
 
   const baseResponse = (status, output) => ({
     id: responseId, object: 'response', created_at: created, status,
@@ -2502,7 +2747,10 @@ function createResponsesSseTranslator(model, responseId, created) {
         }
 
         case 'finish': {
-          finishReason = event.finishReason || null;
+          sawFinish = true;
+          // 必须归一化：截断类不止 'length'（还有 max_output_tokens /
+          // model_context_window_exceeded），原来直接比对原始值会漏判成 completed。
+          finishReason = event.finishReason ? mapFinishReason(event.finishReason) : null;
           const u = event.totalUsage || event.usage || null;
           if (u) {
             normalizeUsage(u);
@@ -2526,12 +2774,27 @@ function createResponsesSseTranslator(model, responseId, created) {
     finish() {
       if (!createdSent) return [];
       const out = closeItem();
-      // finishReason=length 表示被 max_output_tokens 截断：规范要求 status=incomplete
+      // 上游没有正常走完 finish —— 不能报 response.completed（那是把截断谎报成完整）。
+      // 对齐 CLI：按可重试的 upstream_error 处理。
+      const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+      if (incomplete) {
+        log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
+        out.push(sse('response.failed', {
+          response: Object.assign(baseResponse('failed'), {
+            error: { code: 'upstream_error', message: incompleteUpstreamError(incomplete).body.error.message },
+          }),
+        }));
+        return out;
+      }
+      // 'length' 表示被截断（max_output_tokens / model_context_window_exceeded 都归一到这里）；
+      // 'pause_turn' 同样是「后面还有内容没发完」，规范要求 status=incomplete。
       const truncated = finishReason === 'length';
-      out.push(sse(truncated ? 'response.incomplete' : 'response.completed', {
-        response: Object.assign(baseResponse(truncated ? 'incomplete' : 'completed', doneItems.slice()), {
+      const paused = finishReason === 'pause_turn';
+      out.push(sse(truncated || paused ? 'response.incomplete' : 'response.completed', {
+        response: Object.assign(baseResponse(truncated || paused ? 'incomplete' : 'completed', doneItems.slice()), {
           output_text: textAcc,
-          incomplete_details: truncated ? { reason: 'max_output_tokens' } : null,
+          incomplete_details: truncated ? { reason: 'max_output_tokens' }
+            : paused ? { reason: 'pause_turn' } : null,
           usage: buildResponsesUsage(usage, this.outputTokens),
         }),
       }));
@@ -2621,8 +2884,8 @@ async function handleResponses(req, res) {
 
     if (!ccResponse.ok) {
       const errorText = await ccResponse.text().catch(() => '');
-      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses' });
       const mapped = mapCcError(ccResponse.status, errorText);
+      log('error', 'CC API error', { status: ccResponse.status, path: '/v1/responses', code: mapped.code, body: summarizeUpstreamError(errorText) });
       sendResponsesError(res, mapped.status, mapped.body.error.type, mapped.body.error.message, mapped.body.retry_after);
       return;
     }
@@ -2709,8 +2972,8 @@ async function handleResponses(req, res) {
             : 'Response timeout - request timed out';
           if (!started) { sendResponsesError(res, 429, 'rate_limit_error', timeoutMsg, 5); return; }
           if (!res.writableEnded) {
-            try { res.write(translator.errorEvent(timeoutMsg)); } catch (e2) {}
-            try { res.destroy(); } catch (e2) {}
+            // end() 而不是 destroy()：理由见 handleChatCompletions 流式超时分支
+            try { res.end(translator.errorEvent(timeoutMsg)); } catch (e2) {}
           }
         } else {
           log('error', 'Stream error', { message: e.message, path: '/v1/responses' });
@@ -2734,6 +2997,7 @@ async function handleResponses(req, res) {
       let thinkingText = '';
       let usage = null;
       let finishReason = 'stop';
+      let sawFinish = false;
       let upstreamError = null;
       const toolCalls = [];
       reader = ccResponse.body.getReader();
@@ -2763,15 +3027,34 @@ async function handleResponses(req, res) {
               });
               break;
             }
+            case 'finish-step':
             case 'finish':
               lastCcEvent = event.type;
+              sawFinish = true;
               finishReason = mapFinishReason(event.finishReason || 'stop');
               if (event.totalUsage || event.usage) usage = event.totalUsage || event.usage;
               break;
             case 'error':
               lastCcEvent = event.type;
-              log('warn', 'CC stream error (non-stream)', { message: event.error ? event.error.message : event.message });
               upstreamError = mapCcEventError(event);
+              log('warn', 'CC stream error (non-stream)', {
+                message: event.error ? event.error.message : event.message,
+                upstreamStatus: upstreamError.reportedStatus,
+                upstreamRetryable: event.error?.isRetryable,
+                code: upstreamError.code,
+                mappedTo: upstreamError.status,
+              });
+              break;
+            // 无内容的事件：与流式翻译器以及另两条非流式路径保持一致。
+            // 这条路径原先**没有静默列表**，于是上游每个响应都会发的一串无内容事件
+            //（text-start / text-end / start / start-step / reasoning-start / reasoning-end /
+            //  provider-metadata / tool-input-* / tool-error）全部掉进 default 打成
+            // 'Unknown CC event type'，线上刷屏、把真正的错误淹掉。
+            case 'text-start': case 'text-end': case 'start': case 'start-step':
+            case 'reasoning-start': case 'reasoning-end': case 'finish-step':
+            case 'provider-metadata': case 'tool-input-start': case 'tool-input-delta': case 'tool-input-end':
+            case 'tool-error':
+              // Silent - no user-visible content
               break;
             default:
               log('warn', 'Unknown CC event type', { type: event.type });
@@ -2800,6 +3083,18 @@ async function handleResponses(req, res) {
         return;
       }
 
+      // 上游没有正常走完 finish —— 对齐 CLI 按可重试 502 处理，不谎报成功
+      {
+        const incomplete = incompleteUpstreamDetail(sawFinish, finishReason);
+        if (incomplete) {
+          log('warn', 'Upstream stream incomplete', { path: '/v1/responses', reason: incomplete });
+          const err = incompleteUpstreamError(incomplete);
+          try { if (!abortController.signal.aborted) abortController.abort(); } catch {}
+          sendResponsesError(res, err.status, err.body.error.type, err.body.error.message, err.retry_after);
+          return;
+        }
+      }
+
       if (!fullText && !thinkingText && !toolCalls.length) {
         try { if (!abortController.signal.aborted) abortController.abort(); } catch (e2) {}
         sendResponsesError(res, 429, 'rate_limit_error',
@@ -2824,124 +3119,6 @@ async function handleResponses(req, res) {
   }
 }
 
-async function handleModels(req, res) {
-  const apiKey = getApiKey(req.headers);
-  const models = await fetchModels(apiKey);
-  const now = nowUnix();
-  sendJSON(res, 200, {
-    object: 'list',
-    data: models.map(m => ({
-      id: m.id,
-      object: 'model',
-      created: now,
-      owned_by: 'command-code',
-    })),
-  });
-}
+export { handleChatCompletions, handleMessages, handleResponses, buildCcRequest, forwardToCC };
 
-function handleHealth(req, res) {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('OK');
-}
 
-// ── 服务器 ──────────────────────────────────────────
-
-const server = http.createServer(async (req, res) => {
-  // CORS
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', '*');
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
-
-  const host = req.headers.host || 'localhost';
-  const url = new URL(req.url, `http://${host}`);
-
-  // 在途上限准入。/health 与 / 例外：探活与编排器不该因业务繁忙而收 503。
-  const isLiveness = url.pathname === '/health' || url.pathname === '/';
-  if (!isLiveness && MAX_INFLIGHT > 0) {
-    if (inflightCount >= MAX_INFLIGHT) {
-      log('warn', 'In-flight limit reached, rejecting request', {
-        maxInflight: MAX_INFLIGHT, inflight: inflightCount, path: url.pathname,
-      });
-      sendJSON(res, 503, {
-        error: { message: `Too many concurrent requests (limit ${MAX_INFLIGHT}), retry shortly`, type: 'server_busy' },
-        retry_after: 5,
-      });
-      return;
-    }
-    inflightCount++;
-    // 释放时机：响应写完（finish）或连接终止（close）—— 取先到者，且幂等，
-    // 保证任何退出路径（成功/出错/客户端断连/超时）都不会泄漏槽位。
-    let released = false;
-    const release = () => {
-      if (released) return;
-      released = true;
-      if (inflightCount > 0) inflightCount--;
-    };
-    res.once('finish', release);
-    res.once('close', release);
-  }
-
-  try {
-    if (url.pathname === '/v1/chat/completions' && req.method === 'POST') {
-      await handleChatCompletions(req, res);
-    } else if (url.pathname === '/v1/messages' && req.method === 'POST') {
-      await handleMessages(req, res);
-    } else if (url.pathname === '/v1/responses' && req.method === 'POST') {
-      await handleResponses(req, res);
-    } else if (url.pathname === '/v1/models' && req.method === 'GET') {
-      await handleModels(req, res);
-    } else if (url.pathname === '/health' || url.pathname === '/') {
-      handleHealth(req, res);
-    } else {
-      sendJSON(res, 404, { error: { message: 'Not found', type: 'not_found' } });
-    }
-  } catch (e) {
-    sendJSON(res, 500, { error: { message: e.message, type: 'internal_error' } });
-  }
-});
-
-// 全局兜底：abort 触发的异步 rejection 不会让进程崩溃
-process.on('unhandledRejection', (reason) => {
-  if (reason?.name === 'AbortError' || reason?.code === 'ABORT_ERR') {
-    // 客户端断连触发的 abort — 预期行为，静默处理
-    log('info', 'Aborted request cleaned up');
-  } else {
-    log('error', 'Unhandled rejection', { message: reason?.message || String(reason), stack: reason?.stack?.split('\n')[0] });
-  }
-});
-
-server.listen(CFG.port, CFG.host, () => {
-  log('info', 'CC Proxy started', {
-    url: `http://${CFG.host}:${CFG.port}`,
-    api: CFG.apiBase,
-    models: MODELS.length,
-    session: '12h + 1h jitter, per API key',
-    zdr: CFG.zdr ? 'enabled (x-cmd-zdr: 1 on generation/init requests)' : 'off (CMD_ZDR=1 or per-request x-cmd-zdr: 1 to enable)',
-    emptySystemPlaceholder: CFG.emptySystemPlaceholder ? 'on (space placeholder for requests without system prompt, issue #17)' : 'off',
-    logFile: CFG.logFile || '(console only)',
-    clientDrainTimeout: CLIENT_DRAIN_TIMEOUT_MS > 0 ? `${CLIENT_DRAIN_TIMEOUT_MS}ms` : 'disabled',
-    idleTimeouts: `stream ${STREAM_IDLE_TIMEOUT_MS}ms / nonstream ${NONSTREAM_IDLE_TIMEOUT_MS}ms`,
-    maxInflight: MAX_INFLIGHT > 0 ? `${MAX_INFLIGHT} (global, /health exempt)` : 'unlimited (CC_MAX_INFLIGHT=0)',
-  });
-  if (CLIENT_DRAIN_TIMEOUT_MS > 0) {
-    log('info', 'Client drain timeout enabled', { timeoutMs: CLIENT_DRAIN_TIMEOUT_MS });
-  }
-  // 内存提示：body 上限隐含的最坏内存 = 上限 × 实测放大系数（见 MAX_BODY_SIZE 注释 / issue #20）
-  const bodyCapMB = Math.round(MAX_BODY_SIZE / 1048576);
-  const worstCaseMB = Math.round(bodyCapMB * 5.5);
-  if (worstCaseMB >= 500) {
-    log('warn', 'Request body limit implies high per-request worst-case memory', {
-      maxBodyMB: bodyCapMB,
-      worstCaseRSSPerRequestMB: worstCaseMB,
-      hint: 'lower CC_MAX_BODY_MB and/or cap in-flight requests at the reverse proxy (see README)',
-    });
-  }
-  if (!CFG.apiKey) {
-    log('info', 'No API key in config. API key must be sent in Authorization: Bearer <key> header per request.');
-  }
-});
