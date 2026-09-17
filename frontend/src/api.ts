@@ -1,5 +1,10 @@
 export interface Session { email?: string; csrf: string; expires_at?: number }
 export interface Model { id: string }
+export interface UsageWindow { used: number; limit: number; remaining: number; resets_at: number | null }
+export interface Billing {
+  monthly_remaining: number; purchased_remaining: number | null; premium_remaining: number | null; opensource_remaining: number | null;
+  five_hour: UsageWindow | null; weekly: UsageWindow | null; period_end: number | null; updated_at: number;
+}
 export interface Upstream {
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   priority: number; load_factor: number; max_concurrency: number; credential_prefix: string;
@@ -7,6 +12,7 @@ export interface Upstream {
   models: Model[]; models_refreshed_at: number | null; models_error: string | null;
   last_test_at: number | null; latency_ms: number | null; last_error: string | null;
   requests: number; successes: number; errors: number;
+  billing_authorized?: boolean; billing?: Billing | null; billing_error?: string | null; billing_checked_at?: number | null;
 }
 export interface Client {
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
