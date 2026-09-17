@@ -24,7 +24,7 @@ const keepAliveTimeout = Number.isFinite(configuredKeepAliveTimeout) && configur
 const serverOptions = requestTimeout => ({
   requestTimeout,
   keepAliveTimeout,
-  headersTimeout: keepAliveTimeout + 1000,
+  headersTimeout: 10000,
 });
 const management = http.createServer(serverOptions(30000), app.management);
 const inference = http.createServer(serverOptions(60000), app.inference);
