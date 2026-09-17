@@ -32,9 +32,10 @@ onBeforeUnmount(() => { alive = false; clearInterval(timer); document.removeEven
     <p v-if="error || account.billing_error" class="usage-error" role="alert">{{ error || account.billing_error }}{{ billing ? '（以下为上次成功结果）' : '' }}</p>
     <template v-if="billing">
       <div class="usage-values"><div><span>{{ billing.period_basis === 'billing-period' ? '本账期已用' : '官方统计已用' }}</span><strong>{{ money(billing.spent) }}</strong></div><div><span>月度剩余</span><strong>{{ money(billing.monthly_remaining) }}</strong></div><div><span>充值剩余</span><strong>{{ money(billing.purchased_remaining) }}</strong></div><div v-if="billing.free_remaining != null && billing.free_remaining !== 0"><span>免费余额</span><strong>{{ money(billing.free_remaining) }}</strong></div></div>
+      <div class="usage-total"><span>月度总额度</span><strong>{{ billing.monthly ? money(billing.monthly.limit) : '未确认' }}</strong></div>
       <p v-if="billing.summary_error" class="usage-error">{{ billing.summary_error }}</p>
-      <div v-for="entry in [{ label: '5 小时', value: billing.five_hour }, { label: '每周', value: billing.weekly }]" :key="entry.label" class="usage-window">
-        <div><span>{{ entry.label }}</span><span v-if="entry.value">已用 {{ money(entry.value.used) }} / {{ money(entry.value.limit) }}</span><span v-else>官方未提供</span></div>
+      <div v-for="entry in [{ label: '5 小时', value: billing.five_hour }, { label: '每周', value: billing.weekly }, { label: '月度', value: billing.monthly }]" :key="entry.label" class="usage-window">
+        <div><span>{{ entry.label }}</span><span v-if="entry.value">已用 {{ money(entry.value.used) }} / {{ money(entry.value.limit) }} · {{ Math.min(100, Math.max(0, entry.value.used / entry.value.limit * 100)).toFixed(1) }}%</span><span v-else>未确认</span></div>
         <template v-if="entry.value"><progress :value="Math.min(entry.value.used, entry.value.limit)" :max="entry.value.limit" :aria-label="`${entry.label}已用额度`" /><small>剩余 {{ money(entry.value.remaining) }} · 重置 {{ date(entry.value.resets_at) }}</small></template>
       </div>
       <p>更新于 {{ date(billing.updated_at) }} · 页面可见时每 5 分钟自动同步</p>
@@ -48,6 +49,8 @@ onBeforeUnmount(() => { alive = false; clearInterval(timer); document.removeEven
 .usage-values { margin: 14px 0; }
 .usage-values > div { display: grid; gap: 5px; }
 .usage-values strong { font-size: 18px; }
+.usage-total { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border, #e1e5e3); }
+.usage-total strong { font-size: 20px; }
 .usage-window { margin-top: 12px; }
 progress { width: 100%; height: 8px; accent-color: #28735a; }
 .usage-error { color: #a83232; }

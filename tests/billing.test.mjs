@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import test from 'node:test';
-import { BillingService, parseCredits } from '../lib/billing.mjs';
+import { BillingService, monthlyWindow, parseCredits } from '../lib/billing.mjs';
 import { createApplication } from '../lib/application.mjs';
 import { Repository } from '../lib/repository.mjs';
 import { encrypt } from '../lib/security.mjs';
@@ -12,7 +12,7 @@ function account(repo, credential = 'user_upstream_secret') { return repo.create
 function response(status, body) { return new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }); }
 function credits(overrides = {}) { return { credits: { monthlyCredits: 12.5, purchasedCredits: 3, freeCredits: 0, ...overrides }, windowLimits: { fiveHour: { used: 2, cap: 10, resetAt: 1_700_000_000 }, weekly: { used: 8, cap: 20, resetAt: '2026-09-20T00:00:00Z' } } }; }
 function who(org = null) { return { success: true, user: { id: 'hidden-user', email: 'hidden@example.test' }, org }; }
-function subscription() { return { success: true, data: { currentPeriodStart: '2026-09-01T00:00:00Z', currentPeriodEnd: '2026-10-01T00:00:00Z' } }; }
+function subscription(planId = 'individual-pro-v1') { return { success: true, data: { status: 'active', planId, currentPeriodStart: '2026-09-01T00:00:00Z', currentPeriodEnd: '2026-10-01T00:00:00Z' } }; }
 function summary() { return { totalCost: 4.25, periodBasis: 'billing-period', totalTokens: 123 }; }
 function listen(handler) { return new Promise((resolve, reject) => { const server = createServer(handler); server.once('error', reject); server.listen(0, '127.0.0.1', () => resolve({ server, base: `http://127.0.0.1:${server.address().port}` })); }); }
 const close = server => new Promise(resolve => server.close(resolve));
@@ -25,10 +25,22 @@ test('parseCredits accepts zero, numeric strings, unknown/null values, and clamp
   for (const value of [{}, { credits: { monthlyCredits: '' } }, { credits: { monthlyCredits: 'Infinity' } }, { success: false, credits: { monthlyCredits: 1 } }]) assert.throws(() => parseCredits(value), /invalid_billing/);
 });
 
+test('monthlyWindow maps official plans, normalizes prefixes, and rejects unknown or unsafe grants', () => {
+  const end = 1_800_000_000_000;
+  for (const [plan, limit] of [['individual-go', 10], ['individual-goat', 70], ['individual-pro', 30], ['individual-pro-v1', 80], ['individual-provider', 15], ['individual-max', 150], ['individual-ultra', 300], ['teams-pro', 40]]) {
+    assert.deepEqual(monthlyWindow({ success: true, data: { status: 'active', planId: plan, currentPeriodEnd: end } }, 0), { used: limit, limit, remaining: 0, resets_at: end });
+  }
+  assert.equal(monthlyWindow({ success: true, data: { status: 'active', planId: 'individual_pro_v1_extra', currentPeriodEnd: end } }, 12.5).limit, 80);
+  assert.equal(monthlyWindow({ success: true, data: { status: 'active', planId: 'individual_pro_v1_extra', currentPeriodEnd: end } }, 12.5).used, 67.5);
+  for (const subscription of [null, { success: false, data: { status: 'active', planId: 'individual-go' } }, { success: true, data: { status: 'canceled', planId: 'individual-go' } }, { success: true, data: { status: 'active', planId: 'unknown-plan' } }]) assert.equal(monthlyWindow(subscription, 1), null);
+  assert.equal(monthlyWindow({ success: true, data: { status: 'active', planId: 'individual-go' } }, -1), null);
+  assert.equal(monthlyWindow({ success: true, data: { status: 'active', planId: 'individual-go' } }, 11), null);
+});
+
 test('BillingService follows CLI endpoint order, sends Bearer headers, and propagates orgId/since', async t => {
   const repo = new Repository(':memory:', MASTER_KEY); t.after(() => repo.close()); const id = account(repo); const service = new BillingService(repo, 'https://api.example.test'); const calls = []; const originalFetch = globalThis.fetch; t.after(() => { globalThis.fetch = originalFetch; });
   globalThis.fetch = async (url, options) => { calls.push({ url: String(url), options }); assert.equal(options.redirect, 'error'); assert.equal(options.headers.Authorization, 'Bearer user_upstream_secret'); assert.equal(options.headers['x-cli-environment'], 'production'); assert.equal(options.headers.Cookie, undefined); if (calls.length === 1) return response(200, who({ id: 'org-1' })); if (calls.length === 2) return response(200, credits({ freeCredits: 0 })); if (calls.length === 3) return response(200, subscription()); return response(200, summary()); };
-  const result = await service.refresh(id); assert.deepEqual(calls.map(call => new URL(call.url).pathname), ['/alpha/whoami', '/alpha/billing/credits', '/alpha/billing/subscriptions', '/alpha/usage/summary']); assert.equal(new URL(calls[0].url).search, '?limits=1'); for (const call of calls.slice(1)) assert.equal(new URL(call.url).searchParams.get('orgId'), 'org-1'); assert.equal(new URL(calls[3].url).searchParams.get('since'), '2026-09-01T00:00:00.000Z'); assert.equal(result.billing.monthly_remaining, 12.5); assert.equal(result.billing.free_remaining, 0); assert.equal(result.billing.spent, 4.25); assert.equal(result.billing.period_basis, 'billing-period'); assert.equal(result.billing.user, undefined); assert.equal(result.billing.org, undefined); assert.equal(result.raw, undefined);
+  const result = await service.refresh(id); assert.deepEqual(calls.map(call => new URL(call.url).pathname), ['/alpha/whoami', '/alpha/billing/credits', '/alpha/billing/subscriptions', '/alpha/usage/summary']); assert.equal(new URL(calls[0].url).search, '?limits=1'); for (const call of calls.slice(1)) assert.equal(new URL(call.url).searchParams.get('orgId'), 'org-1'); assert.equal(new URL(calls[3].url).searchParams.get('since'), '2026-09-01T00:00:00.000Z'); assert.equal(result.billing.monthly_remaining, 12.5); assert.deepEqual(result.billing.monthly, { used: 67.5, limit: 80, remaining: 12.5, resets_at: 1_790_812_800_000 }); assert.equal(result.billing.free_remaining, 0); assert.equal(result.billing.spent, 4.25); assert.equal(result.billing.period_basis, 'billing-period'); assert.notEqual(result.billing.monthly.used, result.billing.spent); assert.equal(result.billing.user, undefined); assert.equal(result.billing.org, undefined); assert.equal(result.raw, undefined);
 });
 
 test('billing source is cached for 60 seconds and legacy billing session ciphertext is discarded', async t => {

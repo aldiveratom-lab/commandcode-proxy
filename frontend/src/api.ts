@@ -2,6 +2,7 @@ export interface Session { email?: string; csrf: string; expires_at?: number }
 export interface Model { id: string }
 export interface UsageWindow { used: number; limit: number; remaining: number; resets_at: number | null }
 export interface Billing {
+  monthly?: UsageWindow | null;
   free_remaining: number | null; spent: number | null; period_basis: 'billing-period' | 'reported' | null; period_start: number | null; summary_error: string | null;
   monthly_remaining: number; purchased_remaining: number | null; premium_remaining: number | null; opensource_remaining: number | null;
   five_hour: UsageWindow | null; weekly: UsageWindow | null; period_end: number | null; updated_at: number;
