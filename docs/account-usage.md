@@ -1,23 +1,22 @@
 # 账号用量与额度
 
-控制台「上游账号」为每个账号展示官方月度余额、充值余额、5 小时和每周窗口已用/上限/剩余及重置时间。额度池可能重叠，不相加；未知字段显示「未提供」，月度总配额未确认时不推算月度已用金额。
+打开控制台「上游账号」即可自动获取每个账号的官方用量，无需额外登录或复制 Cookie。页面可见时每五分钟同步，也可手动点击「刷新额度」（服务端一分钟缓存）。
 
-## 授权
+展示官方统计已用金额、月度余额、充值余额、免费余额，以及 5 小时和每周窗口已用/上限/剩余及重置时间。仅当官方 summary 明确返回 `periodBasis: billing-period` 时标为「本账期已用」，否则标为「官方统计已用」。未知字段显示「未提供」，不硬编码套餐金额，不把重叠额度池相加。
 
-1. 在 https://commandcode.ai/ 登录对应账号，进入用量或账单页。
-2. 浏览器开发者工具 Network 中找到 `billing/credits` 请求，复制请求头 Cookie 值。
-3. 在自己的控制台「上游账号 → 对应账号 → 用量授权」输入并确认账号归属。不要通过聊天、日志或仓库传递 Cookie。
+## 数据来源
 
-官网会话与推理凭据分别授权，不能自动校验两者账号归属。应由管理员核对登录账号后绑定。服务只保存 `better-auth.session_token`（含 `__Secure-` 变体），使用现有主密钥 AES-GCM 加密，独立上下文绑定账号 ID；API 不回传会话。更换上游凭据、删除账号或移除授权时清除会话和缓存。
+复用已加密保存的上游账号凭据，以 Bearer 和 `x-cli-environment: production` 读取官方 CLI 使用的接口：
 
-页面可见时每五分钟刷新，手动刷新受一分钟缓存限制。官方失败时保留旧值并显示异常及更新时间，不影响推理健康和调度。订阅信息不可用时仍展示成功取得的余额。会话到期后需重新授权。
+- `/alpha/whoami?limits=1`：确认账号与组织范围；有组织时附加 `orgId`。
+- `/alpha/billing/credits`：余额与滚动窗口。
+- `/alpha/billing/subscriptions`：账期开始与结束。
+- `/alpha/usage/summary`：官方已用金额；有账期开始时附加 `since`。
 
-## 接口与存储
+官方接口返回的身份信息和原始响应不保存、不回传、不写日志，仅保留展示需要的数字和时间字段。余额失败保留同凭据下上次结果并标明错误；订阅/汇总失败不影响已成功获取的余额。凭据更换或账号删除会清除缓存，读取账单不影响账号推理健康和调度。
 
-- `PUT /command/api/upstreams/:id/billing/session`：`{ cookie, confirm_account: true }`
-- `DELETE /command/api/upstreams/:id/billing/session`
-- `POST /command/api/upstreams/:id/billing/refresh`
+管理接口 `POST /command/api/upstreams/:id/billing/refresh` 沿用管理员会话与 CSRF 校验。
 
-接口沿用管理员会话与 CSRF 校验。新增 `billing_sessions` 表，旧账号无需重新创建。官方数据源为 `/internal/billing/credits` 和 `/internal/billing/subscriptions`；属于内部接口，可能随上游调整。
+## 从 Cookie 版本升级
 
-实际网页登录授权后的端到端显示仍需验收；本地检查使用模拟账单，禁止把生产凭据导出到本地。
+移除 Cookie 授权入口和 `billing/session` API。首次刷新忽略旧 Cookie 账单缓存，并删除该账号旧的加密 Cookie。保留空的 `billing_sessions` 表以兼容旧数据库，不要求用户操作数据库或重新创建账号。现有两个 HK 账号已验证 CLI 账单接口可用。
