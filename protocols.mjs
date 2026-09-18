@@ -3,13 +3,18 @@
  * 基于真实 CLI 流量抓包数据构建
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-const requestContext = new AsyncLocalStorage();
-export const runProtocol = (context, fn) => requestContext.run(context, fn);
+import http from 'http';
+import https from 'https';
+import tls from 'tls';
+import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+
+const requestContext = new AsyncLocalStorage();
+export const runProtocol = (context, fn) => requestContext.run(context, fn);
 
 // ── 配置加载 ──────────────────────────────────────
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -30,6 +35,7 @@ function loadConfig() {
     fingerprintSalt: '', // 改这个值 = 让所有账号换一台设备（见设备指纹注释）
     deviceProjectDir: '', // 伪造的项目目录（留空则用内置的 C:\Users\dev\projects\app）
     emptySystemPlaceholder: true, // 无 system prompt 时发空格占位，阻止 CC 上游注入 ~7.5K token 默认提示词（issue #17）
+    upstreamProxy: '',            // 上游 HTTP 代理，如 http://127.0.0.1:7890（issue #18）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -55,6 +61,7 @@ function loadConfig() {
   if (process.env.CC_CLI_MODE) defaults.cliMode = process.env.CC_CLI_MODE;
   if (process.env.CC_CLI_SESSION_MODE) defaults.cliSessionMode = process.env.CC_CLI_SESSION_MODE;
   if (process.env.CC_EMPTY_SYSTEM_PLACEHOLDER) defaults.emptySystemPlaceholder = process.env.CC_EMPTY_SYSTEM_PLACEHOLDER !== 'false';
+  if (process.env.CC_UPSTREAM_PROXY) defaults.upstreamProxy = process.env.CC_UPSTREAM_PROXY;
 
   return defaults;
 }
@@ -382,7 +389,7 @@ async function ensureInitialized(apiKey, signal) {
     const fingerprint = state.fingerprint || {};
 
     await Promise.all([
-      fetch(`${apiBase}/alpha/fingerprint/record`, {
+      upstreamFetch(`${apiBase}/alpha/fingerprint/record`, {
         method: 'POST', headers, signal,
         body: JSON.stringify(fingerprint),
       }).then(r => {
@@ -392,7 +399,7 @@ async function ensureInitialized(apiKey, signal) {
         if (e.name !== 'AbortError') log('warn', 'Fingerprint record error', { error: e.message });
       }),
 
-      fetch(`${apiBase}/alpha/lifecycle-events`, {
+      upstreamFetch(`${apiBase}/alpha/lifecycle-events`, {
         method: 'POST', headers, signal,
         body: JSON.stringify({
           eventType: 'cli_session_exists',
@@ -1080,6 +1087,153 @@ function getApiKey(headers) {
   return null;
 }
 
+// ── 上游 HTTP(S) 代理（issue #18）────────────────────
+// 仅作用于发往 CC 上游的请求（/alpha/generate、/provider/v1/models）。
+// 本地监听、/health 与 npm registry 版本检查都不经过代理。
+//
+// 零依赖实现：自己建立 CONNECT 隧道，再用 node:https 复用同一个 socket，
+// 因此不需要 undici / https-proxy-agent，engines >=18 也能用。
+// 注意 Node 原生 fetch 不读 HTTPS_PROXY/HTTP_PROXY；官方的环境变量方案需要
+// Node >= 22.21 / 24.5 并设 NODE_USE_ENV_PROXY=1（README 有说明）。
+const UPSTREAM_PROXY = CFG.upstreamProxy || '';
+const PROXY_CONNECT_TIMEOUT_MS = 15000;
+
+// 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
+// （README 承诺「隐私保护日志」，把口令打进启动横幅是直接违反。）
+function redactProxyUrl(raw) {
+  if (!raw) return '(direct)';
+  try {
+    const u = new URL(raw);
+    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
+  } catch {
+    return '(invalid upstreamProxy)';
+  }
+}
+
+function parseProxyUrl(raw) {
+  let u;
+  try {
+    u = new URL(raw);
+  } catch {
+    // 不回显原串：里面可能就是口令
+    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
+  }
+  if (u.protocol !== 'http:') {
+    throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
+  }
+  const auth = u.username
+    ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
+    : null;
+  return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
+}
+
+// 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
+if (UPSTREAM_PROXY) {
+  try {
+    parseProxyUrl(UPSTREAM_PROXY);
+  } catch (e) {
+    log('error', 'Invalid upstreamProxy, refusing to start', {
+      error: e.message, value: redactProxyUrl(UPSTREAM_PROXY),
+    });
+    process.exit(1);
+  }
+  log('info', 'Upstream requests will go through the configured proxy', {
+    proxy: redactProxyUrl(UPSTREAM_PROXY),
+  });
+}
+
+/** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
+function headersToInit(raw) {
+  const out = [];
+  for (const [k, v] of Object.entries(raw)) {
+    if (Array.isArray(v)) { for (const item of v) out.push([k, String(item)]); }
+    else if (v !== undefined) out.push([k, String(v)]);
+  }
+  return out;
+}
+
+/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
+async function proxyFetch(urlStr, options = {}) {
+  const proxy = parseProxyUrl(UPSTREAM_PROXY);
+  const u = new URL(urlStr);
+  const isTls = u.protocol === 'https:';
+  const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
+  const target = `${u.hostname}:${port}`;
+  const { signal, body } = options;
+  const onAbort = (fn) => { if (signal) signal.addEventListener('abort', fn, { once: true }); };
+
+  // 1. CONNECT 隧道 —— 代理只做裸字节转发，TLS 由本端端到端完成
+  const rawSocket = await new Promise((resolve, reject) => {
+    const connectReq = http.request({
+      host: proxy.host,
+      port: proxy.port,
+      method: 'CONNECT',
+      path: target,
+      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
+      timeout: PROXY_CONNECT_TIMEOUT_MS,
+    });
+    connectReq.on('connect', (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${res.statusCode}`));
+        return;
+      }
+      resolve(socket);
+    });
+    connectReq.on('timeout', () => connectReq.destroy(new Error('upstream proxy CONNECT timeout')));
+    connectReq.on('error', reject);
+    onAbort(() => { try { connectReq.destroy(); } catch {} });
+    connectReq.end();
+  });
+
+  // 2. 隧道上做 TLS（证书按目标主机名校验，不做任何降级）
+  let socket = rawSocket;
+  if (isTls) {
+    socket = tls.connect({ socket: rawSocket, servername: u.hostname });
+    await new Promise((resolve, reject) => {
+      socket.once('secureConnect', resolve);
+      socket.once('error', reject);
+      onAbort(() => { try { socket.destroy(); } catch {} });
+    });
+  }
+
+  // 3. 复用隧道 socket 发请求
+  return await new Promise((resolve, reject) => {
+    const mod = isTls ? https : http;
+    const req = mod.request({
+      host: u.hostname,
+      port,
+      path: u.pathname + u.search,
+      method: options.method || 'GET',
+      headers: options.headers || {},
+      createConnection: () => socket,
+    }, (res) => {
+      // 204/205/304 按规范不允许带 body，Response 构造器会直接抛 —— 这两个状态必须传 null，
+      // 同时把连接排空，避免隧道 socket 悬着。
+      const nullBodyStatus = res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304;
+      if (nullBodyStatus) { try { res.resume(); } catch {} }
+      resolve(new Response(nullBodyStatus ? null : Readable.toWeb(res), {
+        status: res.statusCode,
+        statusText: res.statusMessage,
+        headers: headersToInit(res.headers),
+      }));
+    });
+    req.on('error', reject);
+    onAbort(() => { try { req.destroy(); } catch {} });
+    if (body !== undefined && body !== null) req.write(body);
+    req.end();
+  });
+}
+
+/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
+function upstreamFetch(urlStr, options) {
+  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
+}
+
+export function upstreamProxyLabel() {
+  return redactProxyUrl(UPSTREAM_PROXY);
+}
+
 // ── 流式转发 ────────────────────────────────────────
 
 async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCacheKey) {
@@ -1116,7 +1270,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
   if (context) context.dispatched = true;
   let response;
   try {
-    response = await fetch(`${context?.apiBase || CFG.apiBase}/alpha/generate`, {
+    response = await upstreamFetch(`${context?.apiBase || CFG.apiBase}/alpha/generate`, {
       method: 'POST', headers, body: JSON.stringify(body),
       signal: context?.signal ? AbortSignal.any([signal, context.signal].filter(Boolean)) : signal,
     });
@@ -3119,6 +3273,4 @@ async function handleResponses(req, res) {
   }
 }
 
-export { handleChatCompletions, handleMessages, handleResponses, buildCcRequest, forwardToCC };
-
-
+export { handleChatCompletions, handleMessages, handleResponses, buildCcRequest, forwardToCC, upstreamFetch, redactProxyUrl, upstreamProxyLabel };
