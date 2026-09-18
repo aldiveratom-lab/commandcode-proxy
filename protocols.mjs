@@ -1230,7 +1230,7 @@ function upstreamFetch(urlStr, options) {
   return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
 }
 
-export function upstreamProxyLabel() {
+function upstreamProxyLabel() {
   return redactProxyUrl(UPSTREAM_PROXY);
 }
 
