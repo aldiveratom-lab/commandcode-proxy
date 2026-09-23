@@ -177,3 +177,4 @@ tbody tr:hover { background: #f8fafc; }
   .login-story .brand { font-size: 19px; }
   .login-story-main .pill { font-size: 11px; }
 }
+:root .usage-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr)); gap: 16px; }

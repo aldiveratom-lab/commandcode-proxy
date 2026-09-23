@@ -2,25 +2,31 @@
 
 > [中文文档](README_zh.md)
 
-A reverse proxy that converts Command Code API to OpenAI / Anthropic compatible endpoints. Single file, zero external dependencies.
+A Command Code gateway with a Vue management console and OpenAI / Anthropic compatible inference endpoints. The gateway uses Node.js built-in modules; the frontend has build-time dependencies.
 
 Built by analyzing official CLI network traffic to accurately replicate the Command Code API request protocol, including device-fingerprint and lifecycle pre-requests.
 
-**Features**: OpenAI Chat Completions + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
+**Features**: OpenAI Chat Completions / **Responses API (`/v1/responses`)** + Anthropic Messages API | Streaming & non-streaming | Tool calling (tool_use) | Multimodal image input | Reasoning effort | Dynamic model list | Cache hit metrics | Device fingerprint disguise (per-key, auto-refresh) | `x-api-key` auth (Anthropic SDK) | Client disconnect detection with upstream abort | Zero-output → 429 auto-retry | Consecutive timeout → 429 auto-retry | Privacy-aware logging
 
 **Community**: [Linux.do](https://linux.do) — a friendly Chinese tech community.
 
 ## Quick Start
 
+The management API and console listen on port `3050`; private inference listens on port `3051`. Create a 32-byte hex master key and an administrator password of at least 12 characters in separate secret files. Keep both files outside Git. Set `CC_ORIGIN` to the exact browser origin used for management login.
+
 ```bash
-npm start        # Start (the repo ships with config.json listening on http://0.0.0.0:3050)
-npm run dev      # Watch mode (auto-reload on file changes)
+mkdir -p secrets
+openssl rand -hex 32 > secrets/master-key
+openssl rand -base64 24 > secrets/admin-password
+CC_ORIGIN=https://console.example.com docker compose up -d --build
 ```
+
+Open `https://console.example.com/command/` through your reverse proxy. The initial login is `admin@example.com` unless `CC_ADMIN_EMAIL` is set. `CC_INTERNAL_BASE_URL` controls the inference URL displayed and copied by the console; set it to an address reachable by your clients. See [Management deployment](#management-deployment) for the required settings.
 
 API Key is passed via the `Authorization` request header (or `x-api-key` for Anthropic SDKs) — no need to store it in config files. Key must start with `user_` (automatically matched with any prefix, e.g. `Bearer token_user_xxx`):
 
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
+curl http://127.0.0.1:3051/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek/deepseek-v4-flash","messages":[{"role":"user","content":"hi"}]}'
@@ -33,13 +39,16 @@ commandcode/
 ├── config.json           # Port / log path etc.
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # Single-file proxy core (~1900 lines)
-├── Dockerfile            # Container build (node:22-alpine)
+├── protocols.mjs         # Command Code protocol conversion
+├── server.mjs            # Management and inference listeners
+├── lib/                  # Authentication, storage, billing, scheduling, proxy routing
+├── frontend/             # Vue management console
+├── Dockerfile            # Container build (node:24-alpine)
 ├── docker-compose.yml    # Container orchestration
 ├── .dockerignore         # Build context exclusions
 ├── .github/
 │   └── workflows/
-│       └── docker-publish.yml  # GHCR multi-arch publish on v* tags
+│       └── docker-publish.yml  # release branch / v* tags → GHCR multi-arch (latest + release)
 ├── captured-requests/    # Captured CLI traffic (protocol analysis reference)
 ├── README.md             # This document (English)
 └── README_zh.md          # Chinese documentation
@@ -48,6 +57,8 @@ commandcode/
 ## Configuration
 
 ### config.json
+
+The following table documents protocol options inherited from the standalone proxy. In the integrated server, `PORT` and `INFERENCE_PORT` control the management and inference listeners; the legacy `config.json` `port`/`host` values do not select those listeners.
 
 | Field | Default | Description |
 |------|--------|-------------|
@@ -61,21 +72,35 @@ commandcode/
 | `useProviderModels` | `true` | Dynamically fetch model list from Provider API |
 | `modelRefreshIntervalMs` | `300000` | Model list cache refresh interval (5 min) |
 | `zdr` | `false` | Request ZDR-only routing from Command Code |
+| `cliMode` | `agent` | Envelope `mode`. Upstream enum: `agent` / `learning` / `custom-agent` / `custom-agent-create` / `title-gen` / `tool-desc` / `compact` / `vision` |
+| `cliSessionMode` | `interactive` | `mode` inside the lifecycle metadata (**a different enum**: `interactive` / `non-interactive`) |
+| `fingerprintSalt` | `""` | Salt for the device fingerprint — use it to rotate the whole fleet's identity (one key still always reports one device) |
+| `deviceProjectDir` | `""` | Faked project directory (empty = built-in `C:\Users\dev\projects\app`); changing it gives every account a different device |
+| `emptySystemPlaceholder` | `true` | Send a space placeholder when there is no system prompt, preventing upstream from injecting its ~7.5K-token default ([#17](https://github.com/MAXeaglet/commandcode-proxy/issues/17)) |
 
 ### Environment Variables
 
-| Variable | Overrides |
-|----------|-----------|
-| `PORT` | `port` |
-| `HOST` | `host` |
-| `CC_API_BASE` | `apiBase` |
-| `PROJECT_SLUG` | `projectSlug` |
-| `LOG_FILE` | `logFile` |
-| `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
-| `CC_STREAM_IDLE_MS` | Streaming upstream read idle timeout (default `30000`) |
-| `CC_NONSTREAM_IDLE_MS` | Non-streaming upstream read idle timeout (default `90000`) |
-| `CC_MAX_INFLIGHT` | In-process concurrent request cap (default `0` = unlimited) |
-| `CMD_ZDR` | `zdr` (`1` to enable) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `3000` (shipped config.json uses `3050`) | Listen port → `port` |
+| `HOST` | `0.0.0.0` | Listen address → `host` |
+| `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | Global fallback for accounts without a dedicated upstream proxy; see "Upstream proxy" below → `upstreamProxy` |
+| `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
+| `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
+| `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
+| `CMD_ZDR` | off | `1` enables ZDR-only routing → `zdr` |
+| `CC_CLI_MODE` | `agent` | Envelope `mode` → `cliMode` |
+| `CC_CLI_SESSION_MODE` | `interactive` | Lifecycle metadata `mode` → `cliSessionMode` |
+| `CC_FINGERPRINT_SALT` | empty | Fingerprint salt → `fingerprintSalt` |
+| `CC_DEVICE_PROJECT_DIR` | empty | Faked project directory → `deviceProjectDir` |
+| `CC_EMPTY_SYSTEM_PLACEHOLDER` | `true` | Space placeholder for a missing system prompt; `false` disables → `emptySystemPlaceholder` |
+| `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests get `413` |
+| `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout; see [Upstream idle timeouts](#upstream-idle-timeouts) |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout |
+| `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503`; see [In-flight cap](#in-flight-cap-optional) |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | unset (disabled) | Drop the client once downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
+| `CC_KEEPALIVE_TIMEOUT_MS` | `65000` | Backend keep-alive timeout (`headersTimeout` is set to +1s automatically). **Must be larger than the reverse proxy's keepalive_timeout** — see [keep-alive ordering](#suggested-nginx-front) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -86,6 +111,31 @@ authority for actual retention and provider availability.
 **Request body limit**: independent of `config.json` — requests larger than **100 MB** are rejected with `HTTP 413` (the connection is kept alive and drained, not reset). Override with `CC_MAX_BODY_MB` (positive integer, unit: MB).
 
 > ⚠️ **Memory amplification**: a request body exists in several copies before it reaches upstream; measured peak ≈ body size × **5.1–7.4** (7 MB → +52 MB, 20 MB → +116 MB, while a request rejected with `413` costs only ×1.05). The default `CC_MAX_BODY_MB=100` therefore implies up to ~550 MB for a **single** request, and that limit is per-request, not global. See [Memory & Deployment](#memory--deployment).
+
+### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
+
+In the console's upstream account editor, assign one proxy URL per account. `http://`, `https://`, and `socks5://` are supported, with optional `user:pass@` authentication. A blank value on edit keeps the existing proxy; the remove checkbox clears it. URLs are encrypted at rest, and management responses expose only the scheme, host and port.
+
+The account list's exit-IP check follows Sub2API's proxy probe: it requests fixed IP services through that account's proxy and displays the observed exit IP, region and latency. Results are saved with the account and cleared when its proxy changes. This confirms the network route; use the account generation test to verify that a model accepts the exit region.
+
+The global setting below is used only for accounts without a dedicated proxy:
+
+```json
+{ "upstreamProxy": "http://127.0.0.1:7890" }
+```
+
+```bash
+CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
+```
+
+- Applies to generation, fingerprint/lifecycle pre-requests, model catalogs and billing queries.
+- **Does not** touch the local listener, `/health`, or the npm version check.
+- HTTP/HTTPS proxies use CONNECT tunnels; SOCKS5 uses an optional username/password handshake. No new dependency is required.
+- Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
+- Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
+- Credentials in the proxy URL are never logged: only the scheme, host and port show up.
+
+> Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 
 ## API Endpoints
 
@@ -249,6 +299,23 @@ data: {"type":"message_stop"}
 }
 ```
 
+### `POST /v1/responses`
+
+OpenAI **Responses API** (what Codex and the newer OpenAI SDKs speak).
+
+The request side is translated: `input` (message array; items may omit `type`), `instructions`, `max_output_tokens`, `temperature`, `top_p`, `reasoning`, `tools` and `tool_choice` all map onto the CC envelope; the response comes back in Responses shape (`object: "response"`, `output` array, `usage`, `status`). Streaming is SSE:
+`response.created` / `response.in_progress` / `response.output_item.added|done` / `response.content_part.added|done` / `response.output_text.delta|done` / `response.reasoning_summary_text.delta|done` / `response.function_call_arguments.delta|done`, terminated by `response.completed` (`response.incomplete` when truncated by `max_output_tokens`, `response.failed` on error).
+
+- **Stateless**: `previous_response_id` is not supported and answers `400` — send the full `input` every turn (the proxy stores no conversation history).
+- Errors use the Responses shape: `{"error":{"message":...,"type":...}}`.
+- Shares the same upstream call path, cache breakpoints and idle watchdog as `/v1/chat/completions`.
+
+```bash
+curl http://127.0.0.1:3051/v1/responses \
+  -H "Authorization: Bearer user_xxxxxxxxx" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek/deepseek-v4-flash","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}'
+```
+
 ### `GET /v1/models`
 
 Returns available model list. Fetched dynamically from Provider API (5 min cache), falls back to hardcoded list on failure.
@@ -259,12 +326,29 @@ Health check. Returns `OK`.
 
 ## Error Codes
 
-| HTTP Status | Description |
-|-------------|-------------|
-| 400 | Invalid request format |
-| 401 | API Key missing / invalid format / rejected (Key must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
-| 429 | Zero output tokens, or idle timeout (30s streaming / 90s non-streaming) — SDK auto-retry with `Retry-After`; after 3 consecutive timeouts a "reduce context" hint is returned |
-| 502 | CC upstream error |
+Produced by the proxy itself:
+
+| HTTP | When |
+|------|------|
+| `400` | Body is not valid JSON, `input` is empty, or an unsupported `previous_response_id` is used |
+| `401` | API key missing / malformed (must start with `user_`; sent via `Authorization: Bearer` or `x-api-key`) |
+| `404` | Unknown path |
+| `413` | Body exceeds `CC_MAX_BODY_MB` (connection kept alive and drained, not reset) |
+| `429` | Zero output tokens, stream idle timeout (30s streaming / 90s non-streaming), or an upstream rate-limit mapping — all carry `Retry-After` so SDKs back off; after 3 consecutive timeouts a "reduce context" hint is returned |
+| `502` | CC upstream error (connection-level failures such as `fetch failed` also land here) |
+| `503` | `CC_MAX_INFLIGHT` is set and the in-flight cap is exceeded (`type: server_busy`) |
+
+Upstream CC status mapping (`CC_STATUS_MAP`; anything unlisted becomes `502 upstream_error`):
+
+| Upstream | Downstream |
+|----------|------------|
+| `400` → `400 invalid_request_error` | `401` → `401 authentication_error` |
+| `402` → `429 rate_limit_error` (payment failures are treated as rate limits) | `403` → `401 authentication_error` |
+| `404` → `404 not_found` | `422` → `400 invalid_request_error` |
+| `429` → `429 rate_limit_error` (with `retry_after: 30`) | `500` / `502` → `502 upstream_error` |
+| `503` → `503 temporarily_unavailable` | anything else → `502 upstream_error` |
+
+The machine-readable classification from the upstream error body (`error.code`, e.g. `BAD_REQUEST` / `USAGE_EXCEEDED`) is passed through as `error.code`.
 
 ## Model List
 
@@ -295,7 +379,7 @@ from openai import OpenAI
 
 client = OpenAI(
     api_key="user_xxxxxxxxx",
-    base_url="http://127.0.0.1:3050/v1",
+    base_url="http://127.0.0.1:3051/v1",
 )
 
 response = client.chat.completions.create(
@@ -309,7 +393,7 @@ for chunk in response:
 
 ### cURL
 ```bash
-curl http://127.0.0.1:3050/v1/chat/completions \
+curl http://127.0.0.1:3051/v1/chat/completions \
   -H "Authorization: Bearer user_xxxxxxxxx" \
   -H "Content-Type: application/json" \
   -d '{
@@ -321,7 +405,7 @@ curl http://127.0.0.1:3050/v1/chat/completions \
 
 ### Cursor
 Add a Custom Provider in Cursor settings:
-- **API Base URL**: `http://127.0.0.1:3050/v1`
+- **API Base URL**: `http://127.0.0.1:3051/v1`
 - **API Key**: `user_xxxxxxxxx`
 - **Model**: Choose from the model list
 
@@ -348,14 +432,14 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 ```json
 {
   "provider": "openai-compatible",
-  "baseUrl": "http://127.0.0.1:3050/v1",
+  "baseUrl": "http://127.0.0.1:3051/v1",
   "apiKey": "user_xxxxxxxxx"
 }
 ```
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**) — see `PROTOCOL-FACTS-1.53.1.md`:
+Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
@@ -366,7 +450,8 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |
-| **Project Slug** | `x-project-slug` = `slugify(process.cwd())` — same source as `config.workingDir` |
+| **Project Slug** | `x-project-slug` = `slugify(DEVICE_PROFILE.projectDir)` — same source as `config.workingDir` (default `C:\Users\dev\projects\app`, override with `CC_DEVICE_PROJECT_DIR`) |
+| **Single Source of Device Truth** | Fingerprint / `config.environment` / `config.workingDir` / `x-project-slug` / lifecycle `os` all read one `DEVICE_PROFILE` (`win32` / `x64`) — so they cannot contradict each other ("fingerprint says win32, environment says linux"), and the host's real platform, Node version and cwd are never handed upstream |
 | **Reasoning Effort** | `reasoning_effort` pass-through (low/medium/high/max) |
 | **Key Validation** | Regex `user_[a-zA-Z0-9_-]+` on `Authorization: Bearer` or `x-api-key`, auto-cleans extra paths/prefixes, rejects `sk-xxx` format |
 | **Stream Timeout** | 30s streaming / 90s non-streaming → 429 with SDK auto-retry |
@@ -384,7 +469,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
   "config": {
     "workingDir": "C:\\project",
     "date": "2026-06-07",
-    "environment": "win32-x64, Node.js v24.16.0",
+    "environment": "win32",
     "structure": [],
     "isGitRepo": false,
     "currentBranch": "",
@@ -394,7 +479,7 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
   },
   "memory": null,
   "taste": null,
-  "skills": "",
+  "skills": null,
   "permissionMode": "standard",
   "params": {
     "model": "deepseek/deepseek-v4-flash",
@@ -406,7 +491,9 @@ Aligned line-by-line against the official npm package source (`command-code@1.53
 }
 ```
 
-Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format).
+`config.environment` and `config.workingDir` come from `DEVICE_PROFILE` (not from the host), and `skills` is `null` (not an empty string).
+
+Conditional fields: `system` (extracted from `system` messages), `temperature`, `reasoning_effort`, `tools` (mapped to CC `input_schema` format), `tool_choice`, `parallel_tool_calls`. When a `prompt_cache_key` is present (or the client already set `cache_control`), the breakpoint lands on the last system block — caching is prefix-based and system is that prefix.
 
 ### CC API Image Message Format
 
@@ -426,34 +513,47 @@ The proxy receives OpenAI `image_url` format and converts it to the above CC for
 
 ## Docker Deployment
 
+### Management deployment
+
+The compose file builds this PR's frontend and backend together. It binds management and inference to host loopback ports by default; expose only the management route through a trusted reverse proxy. The master key and initial password are mounted from `CC_SECRETS_DIR` (default `./secrets`). Do not rotate the master key without migrating encrypted account credentials.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CC_ORIGIN` | required | Public management origin used for CSRF and cookies |
+| `CC_ADMIN_EMAIL` | `admin@example.com` | Initial administrator email; existing database records are unchanged |
+| `CC_INTERNAL_BASE_URL` | `http://127.0.0.1:3051/v1` | Inference URL shown to clients in the console |
+| `MANAGEMENT_PORT` / `INFERENCE_PORT` | `3050` / `3051` | Host loopback port bindings |
+| `CC_SECRETS_DIR` | `./secrets` | Directory containing `master-key` and `admin-password` |
+| `CC_DATA_VOLUME` | `commandcode-proxy-data` | Persistent SQLite volume name |
+
+The image is built with Node.js 24. The frontend assets are built inside the Dockerfile. The management API is under `/command/api/`, and inference supports `/v1/chat/completions`, `/v1/responses`, and `/v1/messages` on the private listener. The first run creates an administrator record; subsequent runs use the database record.
+
 ### Pull from GHCR
 
-Pre-built multi-arch images (`linux/amd64` + `linux/arm64`) are published to the GitHub Container Registry automatically on every `v*` tag via GitHub Actions:
+The tags below describe the upstream project's published release image. Build this contribution locally with the compose command above until it is included in a release.
+
+GitHub Actions publishes multi-arch images (`linux/amd64` + `linux/arm64`) to the GitHub Container Registry:
+
+| Tag | Source | Notes |
+|-----|--------|-------|
+| `:release` | `release` branch | Tracks the release branch |
+| `:latest` | `release` branch or `v*` tag | Same digest as `:release`. **"Only updated on version tags" was the old behaviour** — it left `:latest` users stuck on an old build where new endpoints 404'd ([#28](https://github.com/MAXeaglet/commandcode-proxy/issues/28)) |
 
 ```bash
-docker pull ghcr.io/maxeaglet/commandcode-proxy:latest
-docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:latest
+docker pull ghcr.io/maxeaglet/commandcode-proxy:release
+docker run -d --name cc-proxy -p 3050:3050 -e PORT=3050 ghcr.io/maxeaglet/commandcode-proxy:release
 ```
 
-The `latest` tag is updated on each release. The image is public — no login required to pull.
+The image is public — no login required to pull. After upgrading, confirm the digest actually changed (`docker inspect --format '{{index .RepoDigests 0}}'`) rather than assuming your local cache is current.
 
 ### Quick Start (docker compose)
 
-```bash
-docker compose up -d
-```
-
-The proxy will listen on `http://0.0.0.0:3050`. Set `PROXY_PORT` to customize the host port:
-
-```bash
-PROXY_PORT=13050 docker compose up -d
-```
+Use the [Quick Start](#quick-start) command after creating the secret files. `CC_ORIGIN` is required by the compose file.
 
 ### Build from Source
 
 ```bash
 docker build -t commandcode-proxy:latest .
-docker run -d -p 3050:3050 -e PORT=3050 commandcode-proxy:latest
 ```
 
 ### Multi-Architecture Build
@@ -464,19 +564,11 @@ npm run docker:build:multi
 
 ### Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PORT` | `3050` | Container listen port |
-| `PROXY_PORT` | `3050` | Host port (compose only) |
-| `CC_MAX_BODY_MB` | `100` | Max request body size in MB; oversized requests are rejected with `HTTP 413` |
-| `CC_CLIENT_DRAIN_TIMEOUT_MS` | *(unset = disabled)* | Drop the client and abort upstream when downstream backpressure blocks longer than this; see [Stalled clients](#stalled-clients-neither-reading-nor-disconnecting) |
-| `CC_STREAM_IDLE_MS` | `30000` | Streaming upstream read idle timeout in ms; see [Upstream idle timeouts](#upstream-idle-timeouts) |
-| `CC_NONSTREAM_IDLE_MS` | `90000` | Non-streaming upstream read idle timeout in ms |
-| `CC_MAX_INFLIGHT` | `0` (unlimited) | In-process request cap; over-limit returns `503` + `Retry-After`; see [In-flight cap](#in-flight-cap-optional) |
+Use the [Management deployment](#management-deployment) table for container settings. `PORT` defaults to `3050` for management, `INFERENCE_PORT` to `3051` for inference, and `CC_MAX_INFLIGHT` to `4` in this integrated server.
 
 ## In-flight Cap (Optional)
 
-**Off by default** (`CC_MAX_INFLIGHT` unset = no concurrency limit), so existing behaviour is unchanged.
+The integrated server defaults to 4 concurrent inference requests (`CC_MAX_INFLIGHT=4`). The protocol-only runner inherited from upstream defaults to unlimited when this variable is unset.
 
 This project is a **pure proxy layer**; concurrency control belongs downstream — use your reverse proxy for per-IP / per-key limits (see the `limit_conn` block in [Memory & Deployment](#memory--deployment)). This option is **not** a replacement for that; it only covers running **without** a reverse proxy (which both the Dockerfile and `npm start` invite) with an in-process, **global-only** guard:
 
@@ -569,6 +661,12 @@ location /v1/ {
     proxy_read_timeout 300s;   # must exceed the 30s stream idle timeout
 }
 ```
+
+> ⚠️ **keep-alive ordering**: `proxy_set_header Connection ""` above keeps connections to the backend alive, so the
+> reverse proxy's `upstream { keepalive_timeout ...; }` **must be smaller than** the backend's `CC_KEEPALIVE_TIMEOUT_MS`
+> (default 65s). Get it backwards and nginx reuses a connection the backend has already FIN'd, then hits `EPIPE` while
+> writing the POST body (visible in the nginx log as `sendfile() failed (32: Broken pipe)`); POST is not idempotent and
+> nginx does not retry it by default — the client gets a bare 502.
 
 ### Stalled clients (neither reading nor disconnecting)
 

@@ -1,38 +1,28 @@
-## Summary
+## Summary / 概述
 
-### English
-Adds a reusable Vue 3 + TypeScript management console UI for CommandCode-compatible gateways. The UI includes responsive navigation, overview metrics, upstream account management, model allowlists, client API key lifecycle, streaming diagnostics, audit views, and security settings.
+Updates PR #27 from a standalone console UI to the current integrated CommandCode management console and gateway. This contribution brings the Vue frontend and Node.js backend together, based on the latest local `commandcode-proxy/master` at `22576e0` and upstream `master` at `cce214d`.
 
-### 中文
-新增可复用的 Vue 3 + TypeScript 管理控制台界面，适用于兼容 CommandCode 的网关。包含响应式导航、总览指标、上游账号管理、模型白名单、客户端 API 密钥生命周期、流式诊断、审计视图和安全设置。
+将 PR #27 从独立控制台界面更新为前后端一体的 CommandCode 管理控制台和网关；以本地 `commandcode-proxy/master` 的 `22576e0` 及上游 `master` 的 `cce214d` 为基线。
 
-## Scope
+## Changes / 变更
 
-- Frontend-only contribution under `frontend/`.
-- Backend/API integration is configurable through `VITE_API_PREFIX` and defaults to `/api`.
-- No deployment configuration, credentials, infrastructure addresses, private paths, or production data are included.
-- No generated build artifacts are included.
+- Adds separate management (`/command/`, `/command/api/`) and private inference (`/v1/*`) listeners, SQLite persistence, encrypted upstream credentials, administrator sessions and CSRF checks, client key lifecycle, model allowlists, scheduling, audit records, and streaming diagnostics.
+- Connects the Vue console to those APIs, including official account usage, monthly allowance, per-account upstream proxy settings, and proxy exit IP/region checks.
+- Builds the console inside the Node.js 24 image with pnpm 9; updates compose, documentation, and tests for the integrated runtime.
+- Replaces local deployment domains, administrator email, and internal inference address with configurable values. Generated frontend assets and local secret/database files are excluded.
+
+管理与推理分别监听；控制台接入真实管理 API，支持账号用量与月度额度、独立上游代理及出口地区检测；镜像在构建时生成前端资源。部署域名、初始管理员邮箱和展示的推理地址均可配置，不提交生成资源、密钥或本地数据库。
 
 ## Verification / 验证
 
-- `pnpm --dir frontend build` ✅
-- TypeScript project check (`vue-tsc -b`) ✅
-- Vite production build ✅
-- No real browser or external service was used for verification.
+- `npm test`: 48 passed (local mock upstream, no production service).
+- `pnpm --dir frontend test`: 6 passed.
+- `pnpm --dir frontend build`: TypeScript check and Vite build passed.
+- `docker compose config` with an example `CC_ORIGIN`: passed.
+- `docker compose build`: not completed because the local Docker Desktop Linux engine is not running (missing `dockerDesktopLinuxEngine` pipe).
 
-## Security / 安全
+## Deployment notes / 部署说明
 
-- Credentials are never hard-coded.
-- API keys are only displayed through the backend-provided one-time response.
-- Requests use same-origin credentials and CSRF headers supplied by the API session.
-- User-provided text is not written to audit output by the frontend.
+Set `CC_ORIGIN` to the exact public management origin and provide `master-key` and `admin-password` files through `CC_SECRETS_DIR`. `CC_ADMIN_EMAIL` sets the initial login email; `CC_INTERNAL_BASE_URL` sets the URL shown for private inference clients. See `README.md` / `README_zh.md`. Keep the management API behind a trusted reverse proxy and the inference listener private.
 
-## Review notes
-
-This PR intentionally does not change the existing proxy runtime or server routing. It is a UI contribution intended to be adapted to the host project's API conventions.
-
-## 中文审阅说明
-
-本 PR 有意不修改现有代理运行时和服务端路由，仅提供前端控制台界面，方便宿主项目按自身 API 约定集成。
-
-Closes: N/A
+本 PR 改变了启动入口和部署方式；升级已有部署时请保留 SQLite 持久卷与原主密钥。此 PR 未执行生产部署。
