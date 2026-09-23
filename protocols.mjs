@@ -3,15 +3,12 @@
  * 基于真实 CLI 流量抓包数据构建
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
-import http from 'http';
-import https from 'https';
-import tls from 'tls';
-import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { parseProxyUrl, proxyFetch, proxyLabel } from './lib/proxy.mjs';
 
 const requestContext = new AsyncLocalStorage();
 export const runProtocol = (context, fn) => requestContext.run(context, fn);
@@ -1087,152 +1084,29 @@ function getApiKey(headers) {
   return null;
 }
 
-// ── 上游 HTTP(S) 代理（issue #18）────────────────────
-// 仅作用于发往 CC 上游的请求（/alpha/generate、/provider/v1/models）。
+// ── 上游代理 ─────────────────────────────────────
+// 账号专属代理优先；未设置时使用全局回退。只作用于发往 CC 上游的请求。
 // 本地监听、/health 与 npm registry 版本检查都不经过代理。
-//
-// 零依赖实现：自己建立 CONNECT 隧道，再用 node:https 复用同一个 socket，
-// 因此不需要 undici / https-proxy-agent，engines >=18 也能用。
 // 注意 Node 原生 fetch 不读 HTTPS_PROXY/HTTP_PROXY；官方的环境变量方案需要
 // Node >= 22.21 / 24.5 并设 NODE_USE_ENV_PROXY=1（README 有说明）。
 const UPSTREAM_PROXY = CFG.upstreamProxy || '';
-const PROXY_CONNECT_TIMEOUT_MS = 15000;
-
-// 代理 URL 可能带 user:pass —— 任何日志/错误消息都只允许出现 host:port。
-// （README 承诺「隐私保护日志」，把口令打进启动横幅是直接违反。）
-function redactProxyUrl(raw) {
-  if (!raw) return '(direct)';
-  try {
-    const u = new URL(raw);
-    return `${u.protocol}//${u.hostname}${u.port ? ':' + u.port : ''}`;
-  } catch {
-    return '(invalid upstreamProxy)';
-  }
-}
-
-function parseProxyUrl(raw) {
-  let u;
-  try {
-    u = new URL(raw);
-  } catch {
-    // 不回显原串：里面可能就是口令
-    throw new Error('upstreamProxy is not a valid URL (expected http://host:port)');
-  }
-  if (u.protocol !== 'http:') {
-    throw new Error(`upstreamProxy only supports http:// (CONNECT) proxies, got ${u.protocol}//`);
-  }
-  const auth = u.username
-    ? 'Basic ' + Buffer.from(`${decodeURIComponent(u.username)}:${decodeURIComponent(u.password)}`).toString('base64')
-    : null;
-  return { host: u.hostname, port: Number.parseInt(u.port || '80', 10), auth };
-}
-
-// 启动即校验：写错的代理地址应当立刻拒绝启动，而不是每个请求各 502 一次。
+const redactProxyUrl = proxyLabel;
 if (UPSTREAM_PROXY) {
-  try {
-    parseProxyUrl(UPSTREAM_PROXY);
-  } catch (e) {
-    log('error', 'Invalid upstreamProxy, refusing to start', {
-      error: e.message, value: redactProxyUrl(UPSTREAM_PROXY),
-    });
+  try { parseProxyUrl(UPSTREAM_PROXY); }
+  catch (error) {
+    log('error', 'Invalid upstreamProxy, refusing to start', { error: error.message, value: proxyLabel(UPSTREAM_PROXY) });
     process.exit(1);
   }
-  log('info', 'Upstream requests will go through the configured proxy', {
-    proxy: redactProxyUrl(UPSTREAM_PROXY),
-  });
+  log('info', 'Upstream requests will go through the configured proxy', { proxy: proxyLabel(UPSTREAM_PROXY) });
 }
 
-/** Response 的 headers 需要字符串值；node 的 set-cookie 是数组，展开为多行。 */
-function headersToInit(raw) {
-  const out = [];
-  for (const [k, v] of Object.entries(raw)) {
-    if (Array.isArray(v)) { for (const item of v) out.push([k, String(item)]); }
-    else if (v !== undefined) out.push([k, String(v)]);
-  }
-  return out;
+/** Per-account proxy takes precedence over the global fallback. */
+function upstreamFetch(urlStr, options, accountProxy) {
+  const selected = accountProxy ?? requestContext.getStore()?.proxyUrl ?? UPSTREAM_PROXY;
+  return selected ? proxyFetch(urlStr, options, selected) : fetch(urlStr, options);
 }
 
-/** 经 HTTP 代理发上游请求，返回与 fetch 兼容的 Response（.ok/.status/.text()/.body）。 */
-async function proxyFetch(urlStr, options = {}) {
-  const proxy = parseProxyUrl(UPSTREAM_PROXY);
-  const u = new URL(urlStr);
-  const isTls = u.protocol === 'https:';
-  const port = Number.parseInt(u.port || (isTls ? '443' : '80'), 10);
-  const target = `${u.hostname}:${port}`;
-  const { signal, body } = options;
-  const onAbort = (fn) => { if (signal) signal.addEventListener('abort', fn, { once: true }); };
-
-  // 1. CONNECT 隧道 —— 代理只做裸字节转发，TLS 由本端端到端完成
-  const rawSocket = await new Promise((resolve, reject) => {
-    const connectReq = http.request({
-      host: proxy.host,
-      port: proxy.port,
-      method: 'CONNECT',
-      path: target,
-      headers: { Host: target, ...(proxy.auth ? { 'Proxy-Authorization': proxy.auth } : {}) },
-      timeout: PROXY_CONNECT_TIMEOUT_MS,
-    });
-    connectReq.on('connect', (res, socket) => {
-      if (res.statusCode !== 200) {
-        socket.destroy();
-        reject(new Error(`upstream proxy CONNECT ${target} failed: HTTP ${res.statusCode}`));
-        return;
-      }
-      resolve(socket);
-    });
-    connectReq.on('timeout', () => connectReq.destroy(new Error('upstream proxy CONNECT timeout')));
-    connectReq.on('error', reject);
-    onAbort(() => { try { connectReq.destroy(); } catch {} });
-    connectReq.end();
-  });
-
-  // 2. 隧道上做 TLS（证书按目标主机名校验，不做任何降级）
-  let socket = rawSocket;
-  if (isTls) {
-    socket = tls.connect({ socket: rawSocket, servername: u.hostname });
-    await new Promise((resolve, reject) => {
-      socket.once('secureConnect', resolve);
-      socket.once('error', reject);
-      onAbort(() => { try { socket.destroy(); } catch {} });
-    });
-  }
-
-  // 3. 复用隧道 socket 发请求
-  return await new Promise((resolve, reject) => {
-    const mod = isTls ? https : http;
-    const req = mod.request({
-      host: u.hostname,
-      port,
-      path: u.pathname + u.search,
-      method: options.method || 'GET',
-      headers: options.headers || {},
-      createConnection: () => socket,
-    }, (res) => {
-      // 204/205/304 按规范不允许带 body，Response 构造器会直接抛 —— 这两个状态必须传 null，
-      // 同时把连接排空，避免隧道 socket 悬着。
-      const nullBodyStatus = res.statusCode === 204 || res.statusCode === 205 || res.statusCode === 304;
-      if (nullBodyStatus) { try { res.resume(); } catch {} }
-      resolve(new Response(nullBodyStatus ? null : Readable.toWeb(res), {
-        status: res.statusCode,
-        statusText: res.statusMessage,
-        headers: headersToInit(res.headers),
-      }));
-    });
-    req.on('error', reject);
-    onAbort(() => { try { req.destroy(); } catch {} });
-    if (body !== undefined && body !== null) req.write(body);
-    req.end();
-  });
-}
-
-/** 上游请求入口：配了代理走隧道，否则用原生 fetch（默认路径行为完全不变）。 */
-function upstreamFetch(urlStr, options) {
-  return UPSTREAM_PROXY ? proxyFetch(urlStr, options) : fetch(urlStr, options);
-}
-
-function upstreamProxyLabel() {
-  return redactProxyUrl(UPSTREAM_PROXY);
-}
+function upstreamProxyLabel() { return proxyLabel(UPSTREAM_PROXY); }
 
 // ── 流式转发 ────────────────────────────────────────
 

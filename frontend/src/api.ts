@@ -10,6 +10,7 @@ export interface Billing {
 export interface Upstream {
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   priority: number; load_factor: number; max_concurrency: number; credential_prefix: string;
+  proxy_label?: string | null;
   health: string; scheduling: string; inflight: number; cooldown_until: number;
   models: Model[]; models_refreshed_at: number | null; models_error: string | null;
   last_test_at: number | null; latency_ms: number | null; last_error: string | null;

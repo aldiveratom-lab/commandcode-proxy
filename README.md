@@ -74,7 +74,7 @@ commandcode/
 | `PORT` | `3000` (shipped config.json uses `3050`) | Listen port → `port` |
 | `HOST` | `0.0.0.0` | Listen address → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | Upstream base URL → `apiBase` |
-| `CC_UPSTREAM_PROXY` | *(unset)* | Route requests **to the CC upstream** through an HTTP proxy (`http://` CONNECT only); see "Upstream proxy" below → `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | *(unset)* | Global fallback for accounts without a dedicated upstream proxy; see "Upstream proxy" below → `upstreamProxy` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | empty | Log file → `logFile` (**synchronous writes**, see [Other notes](#other-notes)) |
 | `CC_USE_PROVIDER_MODELS` | `true` | Fetch the model list dynamically → `useProviderModels` |
@@ -103,7 +103,9 @@ authority for actual retention and provider availability.
 
 ### Upstream proxy (`upstreamProxy` / `CC_UPSTREAM_PROXY`)
 
-Route the requests the proxy makes **to Command Code** through a local HTTP proxy — for egress-region switching, or for comparing IPs when debugging risk-control `403`s.
+In the console's upstream account editor, assign one proxy URL per account. `http://`, `https://`, and `socks5://` are supported, with optional `user:pass@` authentication. A blank value on edit keeps the existing proxy; the remove checkbox clears it. URLs are encrypted at rest, and management responses expose only the scheme, host and port.
+
+The global setting below is used only for accounts without a dedicated proxy:
 
 ```json
 { "upstreamProxy": "http://127.0.0.1:7890" }
@@ -113,12 +115,12 @@ Route the requests the proxy makes **to Command Code** through a local HTTP prox
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- Applies to `/alpha/generate`, `/alpha/fingerprint/record`, `/alpha/lifecycle-events` and `/provider/v1/models`.
+- Applies to generation, fingerprint/lifecycle pre-requests, model catalogs and billing queries.
 - **Does not** touch the local listener, `/health`, or the npm version check.
-- Only `http://` (CONNECT) proxies are supported. Implemented with a plain CONNECT tunnel plus `node:https` reusing the same socket, so there is **no new dependency** and it works on Node 18+.
+- HTTP/HTTPS proxies use CONNECT tunnels; SOCKS5 uses an optional username/password handshake. No new dependency is required.
 - Each upstream request opens its own tunnel connection. TLS is end-to-end: the certificate is validated against the **target hostname**, never against the proxy.
 - Routing the fingerprint/lifecycle pre-requests through the same proxy matters: if they went out direct while generation went through the proxy, one account would register from two different IPs — exactly the inconsistency you are trying to avoid.
-- Credentials in the proxy URL (`http://user:pass@host:port`) are never logged: only `host:port` shows up.
+- Credentials in the proxy URL are never logged: only the scheme, host and port show up.
 
 > Node's built-in `fetch` does **not** read `HTTPS_PROXY`/`HTTP_PROXY`. The official env-var route requires Node ≥ 22.21 / 24.5 plus `NODE_USE_ENV_PROXY=1`; this option works without either.
 

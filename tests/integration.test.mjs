@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { connect } from 'node:net';
 import test, { after, before } from 'node:test';
 import { createApplication } from '../lib/application.mjs';
 
@@ -339,6 +340,31 @@ test('management auth and account CRUD keep secrets out of records', async () =>
   assert.equal((await managementCall(`/command/api/clients/${temporaryClient.body.id}`)).status, 404);
 });
 
+test('account proxy is encrypted, redacted, editable and removable', async () => {
+  const secret = 'socks5://agent:example-pass@127.0.0.1:18009';
+  const created = await managementCall('/command/api/upstreams', { method: 'POST', body: {
+    name: 'Proxy account', credential: 'user_proxyaccount123', enabled: false, proxy_url: secret,
+  } });
+  assert.equal(created.status, 201);
+  const id = created.body.id;
+  assert.equal(created.body.proxy_label, 'socks5://127.0.0.1:18009');
+  assert.doesNotMatch(JSON.stringify(created.body), /example-pass/);
+  const stored = app.repo.db.prepare('SELECT url FROM upstream_proxies WHERE upstream_id=?').get(id);
+  assert.ok(stored);
+  assert.doesNotMatch(stored.url, /example-pass/);
+  assert.equal(app.repo.proxy(id), secret);
+  const listed = await managementCall('/command/api/upstreams');
+  assert.doesNotMatch(JSON.stringify(listed.body), /example-pass/);
+  const invalid = await managementCall(`/command/api/upstreams/${id}`, { method: 'PATCH', body: { proxy_url: 'ftp://agent:example-pass@127.0.0.1:18009' } });
+  assert.equal(invalid.status, 400);
+  assert.doesNotMatch(invalid.text, /example-pass/);
+  assert.equal(app.repo.proxy(id), secret);
+  const cleared = await managementCall(`/command/api/upstreams/${id}`, { method: 'PATCH', body: { proxy_url: null } });
+  assert.equal(cleared.status, 200);
+  assert.equal(cleared.body.proxy_label, null);
+  assert.equal(app.repo.proxy(id), null);
+});
+
 test('model refresh persists success and failure, and manual test emits SSE lifecycle', async () => {
   const refreshed = await managementCall(`/command/api/upstreams/${goodId}/models/refresh`, { method: 'POST', body: {} });
   assert.equal(refreshed.status, 200);
@@ -571,4 +597,33 @@ test('event statusCode is preserved instead of collapsing to 502', async () => {
   assert.equal(result.status, 429);
   assert.equal(result.body.error.type, 'rate_limit_error');
   assert.equal(result.response.headers.get('retry-after'), '30');
+});
+
+test('one account routes model refresh, initialization and inference through its proxy', async t => {
+  const sockets = new Set(); let connects = 0;
+  const proxy = createServer();
+  proxy.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  proxy.on('connect', (req, client) => {
+    connects++;
+    const target = new URL(`http://${req.url}`);
+    const upstream = connect(Number(target.port), target.hostname, () => {
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      client.pipe(upstream); upstream.pipe(client);
+    });
+    upstream.on('error', () => client.destroy()); client.on('close', () => upstream.destroy());
+  });
+  const port = await new Promise(resolve => proxy.listen(0, '127.0.0.1', () => resolve(proxy.address().port)));
+  t.after(async () => { for (const socket of sockets) socket.destroy(); await close(proxy); });
+  const credential = 'user_proxyroute123456';
+  state.catalogByCredential.set(credential, { status: 200, ids: ['proxy-only-model'] });
+  const created = await managementCall('/command/api/upstreams', { method: 'POST', body: {
+    name: 'Routed account', credential, whitelist: ['proxy-only-model'], proxy_url: `http://agent:pass@127.0.0.1:${port}`,
+  } });
+  assert.equal(created.status, 201);
+  const refreshed = await managementCall(`/command/api/upstreams/${created.body.id}/models/refresh`, { method: 'POST', body: {} });
+  assert.equal(refreshed.status, 200);
+  const generated = await inferenceCall('/v1/chat/completions', { method: 'POST', headers: { authorization: `Bearer ${clientKey}` },
+    body: { model: 'proxy-only-model', messages: [{ role: 'user', content: 'via account proxy' }], stream: false } });
+  assert.equal(generated.status, 200);
+  assert.ok(connects >= 4, `expected model, two initialization and generation tunnels; received ${connects}`);
 });

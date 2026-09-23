@@ -74,7 +74,7 @@ commandcode/
 | `PORT` | `3000`（自带 config.json 为 `3050`）| 监听端口 → `port` |
 | `HOST` | `0.0.0.0` | 监听地址 → `host` |
 | `CC_API_BASE` | `https://api.commandcode.ai` | 上游地址 → `apiBase` |
-| `CC_UPSTREAM_PROXY` | 空 | 让**发往 CC 上游**的请求走 HTTP 代理（仅 `http://` CONNECT），见下文「上游代理」→ `upstreamProxy` |
+| `CC_UPSTREAM_PROXY` | 空 | 未设置账号专属代理时的全局上游代理，见下文「上游代理」→ `upstreamProxy` |
 | `PROJECT_SLUG` | `cc-proxy` | `x-project-slug` → `projectSlug` |
 | `LOG_FILE` | 空 | 日志文件 → `logFile`（**同步写**，见[其它注意事项](#其它注意事项)）|
 | `CC_USE_PROVIDER_MODELS` | `true` | 动态拉取模型列表 → `useProviderModels` |
@@ -101,7 +101,9 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 ### 上游代理（`upstreamProxy` / `CC_UPSTREAM_PROXY`）
 
-让代理**发往 Command Code 的请求**走本地 HTTP 代理 —— 用于出口地区调整，或排查风控 `403` 时做 IP 维度对照。
+在控制台「上游账号」的新增或编辑窗口，可为每个账号填写一条专属代理链接，支持 `http://`、`https://` 和 `socks5://`，可带 `user:pass@`。留空则沿用全局设置；编辑时留空表示保持原值，也可勾选移除。代理链接加密保存，管理接口仅返回不含账号密码的地址。
+
+以下全局设置作为未配置账号专属代理时的回退：
 
 ```json
 { "upstreamProxy": "http://127.0.0.1:7890" }
@@ -111,12 +113,12 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 CC_UPSTREAM_PROXY=http://127.0.0.1:7890 npm start
 ```
 
-- 作用于 `/alpha/generate`、`/alpha/fingerprint/record`、`/alpha/lifecycle-events` 与 `/provider/v1/models`。
+- 作用于生成、指纹与 lifecycle 预请求、模型目录及额度查询。
 - **不影响**本地监听、`/health` 与 npm 版本检查。
-- 仅支持 `http://`（CONNECT）代理。实现方式是自建 CONNECT 隧道 + `node:https` 复用同一 socket，**不新增任何依赖**，Node 18+ 即可用。
+- HTTP/HTTPS 代理使用 CONNECT 隧道；SOCKS5 使用带可选账号密码的握手，**不新增任何依赖**。
 - 每个上游请求各自建立一条隧道连接。TLS 为端到端：证书按**目标主机名**校验，绝不针对代理降级。
 - **指纹/lifecycle 预请求也走代理**是刻意的：若它们直连而上游生成走代理，同一账号会从两个不同 IP 注册 —— 正是你想避免的那种矛盾。
-- 代理地址里带账号密码（`http://user:pass@host:port`）时，日志只保留 `host:port`，**不打印口令**。
+- 代理地址里带账号密码时，日志只保留协议、主机和端口，**不打印口令**。
 
 > Node 原生 `fetch` **不读** `HTTPS_PROXY`/`HTTP_PROXY`。官方环境变量路线需要 Node ≥ 22.21 / 24.5 且设 `NODE_USE_ENV_PROXY=1`；本选项两者都不需要。
 
