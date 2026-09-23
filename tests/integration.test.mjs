@@ -627,3 +627,22 @@ test('one account routes model refresh, initialization and inference through its
   assert.equal(generated.status, 200);
   assert.ok(connects >= 4, `expected model, two initialization and generation tunnels; received ${connects}`);
 });
+
+test('manual account test reports the upstream event statusCode', async () => {
+  const model = 'region-restricted-model';
+  state.generateByModel.set(model, { status: 200, events: [
+    { type: 'start' },
+    { type: 'error', error: { message: 'Country, region, or territory not supported', statusCode: 403 } },
+  ] });
+  const created = await managementCall('/command/api/upstreams', { method: 'POST', body: {
+    name: 'Restricted model account', credential: 'user_restricted123', enabled: false, whitelist: [model],
+  } });
+  assert.equal(created.status, 201);
+  const result = await managementCall(`/command/api/upstreams/${created.body.id}/test`, { method: 'POST', body: { model, prompt: 'Reply OK.' } });
+  assert.equal(result.status, 200);
+  const events = sseEvents(result.text);
+  assert.equal(events.at(-1).event, 'done');
+  assert.equal(events.at(-1).data.success, false);
+  assert.match(events.at(-1).data.error, /HTTP 403/);
+  assert.doesNotMatch(events.at(-1).data.error, /HTTP 502/);
+});
