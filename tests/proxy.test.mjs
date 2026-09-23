@@ -78,3 +78,21 @@ test('authenticated HTTP CONNECT and SOCKS5 proxies forward to the target', asyn
   assert.equal(await viaSocks.text(), 'target:/socks');
   assert.equal(socksAuth, 'agent:pass');
 });
+
+test('the request itself uses the CONNECT tunnel instead of opening a direct connection', async t => {
+  const proxy = createHttpServer();
+  let targetRequest = '';
+  proxy.on('connect', (req, socket) => {
+    assert.equal(req.url, 'unresolvable.invalid:80');
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.once('data', chunk => {
+      targetRequest = chunk.toString();
+      socket.end('HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nvia-proxy');
+    });
+  });
+  const port = await listen(proxy);
+  t.after(() => close(proxy));
+  const response = await proxyFetch('http://unresolvable.invalid/proxy-only', {}, `http://127.0.0.1:${port}`);
+  assert.equal(await response.text(), 'via-proxy');
+  assert.match(targetRequest, /^GET \/proxy-only HTTP\/1\.1/);
+});
