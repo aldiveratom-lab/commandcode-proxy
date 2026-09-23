@@ -646,3 +646,35 @@ test('manual account test reports the upstream event statusCode', async () => {
   assert.match(events.at(-1).data.error, /HTTP 403/);
   assert.doesNotMatch(events.at(-1).data.error, /HTTP 502/);
 });
+
+test('account proxy check reports its tunnel exit IP and clears stale results on change', async t => {
+  const sockets = new Set();
+  const proxy = createServer();
+  proxy.on('connection', socket => { sockets.add(socket); socket.on('close', () => sockets.delete(socket)); });
+  proxy.on('connect', (req, socket) => {
+    assert.equal(req.url, 'ip-api.com:80');
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.once('data', () => {
+      const body = JSON.stringify({ status: 'success', query: '203.0.113.7', countryCode: 'US', country: 'United States', regionName: 'Texas', city: 'Dallas' });
+      socket.end(`HTTP/1.1 200 OK\r\nContent-Length: ${Buffer.byteLength(body)}\r\nConnection: close\r\n\r\n${body}`);
+    });
+  });
+  const port = await new Promise(resolve => proxy.listen(0, '127.0.0.1', () => resolve(proxy.address().port)));
+  t.after(async () => { for (const socket of sockets) socket.destroy(); await close(proxy); });
+  const created = await managementCall('/command/api/upstreams', { method: 'POST', body: {
+    name: 'Probe account', credential: 'user_probeaccount123', enabled: false, proxy_url: `http://agent:secret@127.0.0.1:${port}`,
+  } });
+  assert.equal(created.status, 201);
+  const checked = await managementCall(`/command/api/upstreams/${created.body.id}/proxy/check`, { method: 'POST', body: {} });
+  assert.equal(checked.status, 200);
+  assert.equal(checked.body.proxy_probe.success, true);
+  assert.equal(checked.body.proxy_probe.exit_ip, '203.0.113.7');
+  assert.equal(checked.body.proxy_probe.country_code, 'US');
+  assert.equal(checked.body.proxy_probe.region, 'Texas');
+  assert.doesNotMatch(checked.text, /secret/);
+  const cleared = await managementCall(`/command/api/upstreams/${created.body.id}`, { method: 'PATCH', body: { proxy_url: null } });
+  assert.equal(cleared.body.proxy_probe, null);
+  const missing = await managementCall(`/command/api/upstreams/${created.body.id}/proxy/check`, { method: 'POST', body: {} });
+  assert.equal(missing.status, 400);
+  assert.equal(missing.body.error.code, 'proxy_not_configured');
+});

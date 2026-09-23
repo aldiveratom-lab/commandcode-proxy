@@ -11,6 +11,7 @@ export interface Upstream {
   id: string; name: string; notes: string; enabled: boolean; whitelist: string[];
   priority: number; load_factor: number; max_concurrency: number; credential_prefix: string;
   proxy_label?: string | null;
+  proxy_probe?: { success: boolean; exit_ip?: string; country_code?: string | null; country?: string | null; region?: string | null; city?: string | null; latency_ms?: number; checked_at: number; message?: string } | null;
   health: string; scheduling: string; inflight: number; cooldown_until: number;
   models: Model[]; models_refreshed_at: number | null; models_error: string | null;
   last_test_at: number | null; latency_ms: number | null; last_error: string | null;

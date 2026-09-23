@@ -105,6 +105,8 @@ authority for actual retention and provider availability.
 
 In the console's upstream account editor, assign one proxy URL per account. `http://`, `https://`, and `socks5://` are supported, with optional `user:pass@` authentication. A blank value on edit keeps the existing proxy; the remove checkbox clears it. URLs are encrypted at rest, and management responses expose only the scheme, host and port.
 
+The account list's exit-IP check follows Sub2API's proxy probe: it requests fixed IP services through that account's proxy and displays the observed exit IP, region and latency. Results are saved with the account and cleared when its proxy changes. This confirms the network route; use the account generation test to verify that a model accepts the exit region.
+
 The global setting below is used only for accounts without a dedicated proxy:
 
 ```json

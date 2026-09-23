@@ -96,3 +96,15 @@ test('the request itself uses the CONNECT tunnel instead of opening a direct con
   assert.equal(await response.text(), 'via-proxy');
   assert.match(targetRequest, /^GET \/proxy-only HTTP\/1\.1/);
 });
+
+test('abort closes a tunneled response that stalls after headers', async t => {
+  const proxy = createHttpServer();
+  proxy.on('connect', (_req, socket) => {
+    socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    socket.once('data', () => socket.write('HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n'));
+  });
+  const port = await listen(proxy);
+  t.after(() => close(proxy));
+  const response = await proxyFetch('http://unresolvable.invalid/stall', { signal: AbortSignal.timeout(100) }, `http://127.0.0.1:${port}`);
+  await assert.rejects(response.body.getReader().read());
+});
